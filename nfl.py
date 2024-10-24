@@ -463,65 +463,72 @@ def retrain_model(season, week, df):
 
 app = dash.Dash(__name__, title="NFL Touchdown Predictions", external_stylesheets=['https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap'])
 app.layout = html.Div([
-    html.H1("NFL Touchdown Predictions", style={'fontFamily': 'Roboto'}),
+    html.H1("NFL Touchdown Predictions", style={'fontFamily': 'Roboto', 'color': '#4cc9f0', 'textAlign': 'center'}),
 
-    dcc.Input(id='input-season', type='number', placeholder='Enter season (e.g. 2023)', min=2020, max=2050),
-    dcc.Input(id='input-week', type='number', placeholder='Enter week (1-20)', min=1, max=20),
+    html.Div([
+        dcc.Input(id='input-season', type='number', placeholder='Enter season (e.g. 2023)', min=2020, max=2050, 
+                  style={'backgroundColor': '#4361ee', 'color': 'white', 'border': '1px solid #7209b7', 'borderRadius': '5px', 'marginRight': '10px'}),
+        dcc.Input(id='input-week', type='number', placeholder='Enter week (1-20)', min=1, max=20, 
+                  style={'backgroundColor': '#4361ee', 'color': 'white', 'border': '1px solid #7209b7', 'borderRadius': '5px'})
+    ], style={'padding': '10px 0'}),
 
-    html.Button('Load Data', id='load-data-btn', style={'marginRight': '10px'}),
-    html.Button('Predict Week', id='predict-week-btn', style={'marginRight': '10px'}),
-    html.Button('Retrain Model', id='retrain-model-btn', style={'backgroundColor': 'transparent', 'border': '2px solid #1E90FF', 'color': '#1E90FF'}),
+    html.Div([
+        html.Button('Load Data', id='load-data-btn', style={'backgroundColor': '#f72585', 'color': 'white', 'border': 'none', 'borderRadius': '5px', 'padding': '10px', 'marginRight': '10px'}),
+        html.Button('Predict Week', id='predict-week-btn', style={'backgroundColor': '#7209b7', 'color': 'white', 'border': 'none', 'borderRadius': '5px', 'padding': '10px', 'marginRight': '10px'}),
+        html.Button('Retrain Model', id='retrain-model-btn', style={'backgroundColor': 'transparent', 'border': '2px solid #4cc9f0', 'color': '#4cc9f0', 'borderRadius': '5px', 'padding': '10px'})
+    ], style={'padding': '10px 0'}),
 
     # ConfirmDialog to ask the user for confirmation before retraining the model
     dcc.ConfirmDialog(
         id='confirm-retrain-dialog',
-        message='A model has already been trained on data previous to this season and week. Are you sure you want to overwrite it?'
+        message='A model has already been trained on data previous to this season and week. Are you sure you want to overwrite it?',
     ),
 
-    html.Div(id='output-message'),
+    html.Div(id='output-message', style={'color': 'white', 'padding': '10px 0'}),
+
     dcc.Loading(
         id='loading',
         type='default',
         children=[
-             dash_table.DataTable(
+            dash_table.DataTable(
                 id='output-table',
                 columns=[],  # Columns will be set dynamically
                 data=[],     # Data will be set dynamically
                 style_header={
-                    'backgroundColor': '#2b2b2b',  # Dark header background
+                    'backgroundColor': '#7209b7',  # Dark header background
                     'color': 'white',  # White text
                     'fontWeight': 'bold',
-                    'border': '1px solid #444'  # Darker border
+                    'border': '1px solid #4cc9f0'  # Accent border
                 },
                 style_data={
-                    'backgroundColor': '#1e1e1e',  # Dark background for cells
+                    'backgroundColor': '#3a0ca3',  # Dark background for cells
                     'color': '#e0e0e0',  # Light text color
-                    'border': '1px solid #444',  # Border between cells
+                    'border': '1px solid #4cc9f0',  # Border between cells
                 },
                 style_cell={
                     'fontFamily': 'Roboto',  # Use Roboto font
                     'fontSize': '14px',
                     'padding': '10px',  # Add some padding to cells
                     'textAlign': 'left',
-                    'border': '1px solid #444'  # Border for each cell
+                    'border': '1px solid #4cc9f0'  # Border for each cell
                 },
                 style_data_conditional=[  # Optional: hover effects
                     {
                         'if': {'state': 'active'},
-                        'backgroundColor': '#3a3a3a',
-                        'border': '1px solid #555',
+                        'backgroundColor': '#7209b7',
+                        'border': '1px solid #4361ee',
                     },
                     {
                         'if': {'state': 'selected'},
-                        'backgroundColor': '#4a4a4a',
-                        'border': '1px solid #666',
+                        'backgroundColor': '#f72585',
+                        'border': '1px solid #4361ee',
                     }
                 ],
                 style_table={'overflowX': 'auto'},  # To handle wide tables
-             )
+            )
         ]
     )
-])
+], style={'backgroundColor': '#3a0ca3', 'padding': '20px', 'minHeight': '100vh'})
 
 df, current_week = None, None
 
