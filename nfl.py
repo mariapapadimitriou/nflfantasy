@@ -533,7 +533,7 @@ def retrain_model(season, week, df):
     else:
         # Simulate saving the model
         trainModel(df, season, week)
-        return True, f"Model for season {season}, week {week} has been retrained and saved."
+        return True, f"Model (using data prior to season {season}, week {week}) has been retrained and saved."
 
 df, current_week = None, None
 @app.callback(
