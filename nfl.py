@@ -174,65 +174,6 @@ def trainModel(df, season, week):
     
     return classification_report(y_test, y_pred_binary)
 
-app = dash.Dash(__name__, title="NFL Touchdown Predictions", external_stylesheets=['https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap'])
-app.layout = html.Div([
-    html.H1("NFL Touchdown Predictions", className='header-title'),
-    
-    # Input fields for season and week
-    dcc.Input(
-        id='input-season', 
-        type='number', 
-        placeholder='Enter season (e.g. 2023)', 
-        min=2000, max=2050, 
-        className='input-field'
-    ),
-    dcc.Input(
-        id='input-week', 
-        type='number', 
-        placeholder='Enter week (1-20)', 
-        min=1, max=20, 
-        className='input-field'
-    ),
-
-    # Action buttons
-    html.Button('Load Data', id='load-data-btn', className='action-button'),
-    html.Button('Predict Week', id='predict-week-btn', className='action-button'),
-    html.Button('Retrain Model', id='retrain-model-btn', className='action-button'),
-
-    # Loading indicator and output section
-    dcc.Loading(
-        id='loading',
-        type='default',
-        children=[
-            html.Div(id='output-message', className='output-message'),
-            
-            dash_table.DataTable(
-                id='output-table', 
-                columns=[], 
-                data=[],
-                style_table={
-                    'overflowX': 'auto',
-                    'backgroundColor': '#2A2E4A'  # Dark background for the table
-                },
-                style_header={
-                    'backgroundColor': '#3D4357',  # Darker header background
-                    'fontWeight': 'bold',
-                    'color': '#E0FBFC'
-                },
-                style_cell={
-                    'backgroundColor': '#2A2E4A',  # Dark cell background
-                    'color': '#D1D9E6',  # Light text color
-                    'border': '1px solid #4F5D75',  # Border color for cells
-                    'padding': '10px',  # Cell padding
-                    'fontFamily': 'Roboto, sans-serif'  # Roboto font for table cells
-
-                }
-            )
-        ]
-    )
-], className='main-container')
-
-
 # Function to simulate loading data
 def load_data(season, week):
     years = list(range(season-2, season+1))
@@ -519,57 +460,137 @@ def retrain_model(season, week, df):
         trainModel(df, season, week)
         return True, f"Model (using data prior to season {season}, week {week}) has been retrained and saved."
 
+
+app = dash.Dash(__name__, title="NFL Touchdown Predictions", external_stylesheets=['https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap'])
+app.layout = html.Div([
+    html.H1("NFL Touchdown Predictions", style={'fontFamily': 'Roboto'}),
+
+    dcc.Input(id='input-season', type='number', placeholder='Enter season (e.g. 2023)', min=2020, max=2050),
+    dcc.Input(id='input-week', type='number', placeholder='Enter week (1-20)', min=1, max=20),
+
+    html.Button('Load Data', id='load-data-btn', style={'marginRight': '10px'}),
+    html.Button('Predict Week', id='predict-week-btn', style={'marginRight': '10px'}),
+    html.Button('Retrain Model', id='retrain-model-btn', style={'backgroundColor': 'transparent', 'border': '2px solid #1E90FF', 'color': '#1E90FF'}),
+
+    # ConfirmDialog to ask the user for confirmation before retraining the model
+    dcc.ConfirmDialog(
+        id='confirm-retrain-dialog',
+        message='A model has already been trained on data previous to this season and week. Are you sure you want to overwrite it?'
+    ),
+
+    html.Div(id='output-message'),
+    dcc.Loading(
+        id='loading',
+        type='default',
+        children=[
+             dash_table.DataTable(
+                id='output-table',
+                columns=[],  # Columns will be set dynamically
+                data=[],     # Data will be set dynamically
+                style_header={
+                    'backgroundColor': '#2b2b2b',  # Dark header background
+                    'color': 'white',  # White text
+                    'fontWeight': 'bold',
+                    'border': '1px solid #444'  # Darker border
+                },
+                style_data={
+                    'backgroundColor': '#1e1e1e',  # Dark background for cells
+                    'color': '#e0e0e0',  # Light text color
+                    'border': '1px solid #444',  # Border between cells
+                },
+                style_cell={
+                    'fontFamily': 'Roboto',  # Use Roboto font
+                    'fontSize': '14px',
+                    'padding': '10px',  # Add some padding to cells
+                    'textAlign': 'left',
+                    'border': '1px solid #444'  # Border for each cell
+                },
+                style_data_conditional=[  # Optional: hover effects
+                    {
+                        'if': {'state': 'active'},
+                        'backgroundColor': '#3a3a3a',
+                        'border': '1px solid #555',
+                    },
+                    {
+                        'if': {'state': 'selected'},
+                        'backgroundColor': '#4a4a4a',
+                        'border': '1px solid #666',
+                    }
+                ],
+                style_table={'overflowX': 'auto'},  # To handle wide tables
+             )
+        ]
+    )
+])
+
 df, current_week = None, None
+
 @app.callback(
     [Output('output-message', 'children'),
      Output('output-table', 'columns'),
-     Output('output-table', 'data')],
+     Output('output-table', 'data'),
+     Output('confirm-retrain-dialog', 'displayed')],
     [Input('load-data-btn', 'n_clicks'),
      Input('predict-week-btn', 'n_clicks'),
-     Input('retrain-model-btn', 'n_clicks')],
+     Input('retrain-model-btn', 'n_clicks'),
+     Input('confirm-retrain-dialog', 'submit_n_clicks')],
     [State('input-season', 'value'),
      State('input-week', 'value')]
 )
-def handle_buttons(load_clicks, predict_clicks, retrain_clicks, season, week):
+def handle_buttons(load_clicks, predict_clicks, retrain_clicks, confirm_retrain_clicks, season, week):
     global df, current_week
     ctx = dash.callback_context
 
     # Check if any button is clicked
     if not ctx.triggered:
-        return "", [], []  # No button clicked yet
+        return "", [], [], False  # No button clicked yet
 
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
     # General validation for season and week inputs
     if not season or not week:
-        return "Please enter both season and week to proceed.", [], []
+        return "Please enter both season and week to proceed.", [], [], False
 
+    # Handle Load Data Button
     if button_id == 'load-data-btn':
-        # Load data logic
         message, df, current_week = load_data_from_csv(season, week)
         if message is None:
-            # If not, load data and save as CSV
             message, df, current_week = load_data(season, week)
-        return message, [], []  # No table data for this action
+        return message, [], [], False
 
+    # Handle Predict Week Button
     elif button_id == 'predict-week-btn':
-        # Check if data is loaded before predicting
         if current_week is not None:
-            df_predicted = predict_week(season, week, current_week)  # Adjust this if necessary
-            columns = [{'name': i, 'id': i} for i in df_predicted.columns]  # Set columns for DataTable
-            return "", columns, df_predicted.to_dict('records')  # Return table data
+            df_predicted = predict_week(season, week, current_week)
+            columns = [{'name': i, 'id': i} for i in df_predicted.columns]
+            return "", columns, df_predicted.to_dict('records'), False
         else:
-            return "Data not loaded. Please load the data first before predicting.", [], []
+            return "Data not loaded. Please load the data first before predicting.", [], [], False
 
+    # Handle Retrain Model Button
     elif button_id == 'retrain-model-btn':
-        # Check if data is loaded before retraining
+        model_path = f"Model/xgboost_model-{season}-{week}.json"
+
+        if os.path.exists(model_path):
+
+            return "", [], [], True
+
+        # No existing model found, retrain directly
+        elif df is not None:
+            success, message = retrain_model(season, week, df)
+            return message, [], [], False
+        else:
+            return "Data not loaded. Please load the data first before retraining the model.", [], [], False
+
+    elif button_id == 'confirm-retrain-dialog' and confirm_retrain_clicks:
         if df is not None:
             success, message = retrain_model(season, week, df)
-            return message, [], []  # No table data for this action
-        else:
-            return "Data not loaded. Please load the data first before retraining the model.", [], []
+            return message, [], [], False
 
-    return "", [], []  # Default return if no condition is met
+    return "", [], [], False 
+
+if __name__ == '__main__':
+    app.run_server(debug=True)
 
 
 app.index_string = '''

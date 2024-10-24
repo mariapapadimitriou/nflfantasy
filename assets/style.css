@@ -48,6 +48,10 @@ table {
     color: #D1D9E6;
 }
 
+#output-table {
+    background-color: #2A2E4A;
+}
+
 th, td {
     padding: 10px;
     border: 1px solid #4F5D75;
