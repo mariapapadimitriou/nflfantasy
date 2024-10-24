@@ -2,32 +2,16 @@ import nfl_data_py as nfl
 import pandas as pd
 import numpy as np
 import os
-import urllib.request
-import matplotlib.pyplot as plt
-from matplotlib.offsetbox import AnnotationBbox, OffsetImage
-from imblearn.under_sampling import RandomUnderSampler
-from imblearn.combine import SMOTETomek
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OrdinalEncoder
 from sklearn.compose import ColumnTransformer
-from sklearn.linear_model import LogisticRegression
-from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
+from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, log_loss, roc_auc_score, f1_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import cross_val_score
-from sklearn.pipeline import make_pipeline
-from xgboost import XGBClassifier
 import xgboost as xgb
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, classification_report, log_loss
-from sklearn.model_selection import StratifiedKFold
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.impute import SimpleImputer
 import optuna
 from imblearn.over_sampling import SMOTE
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
-from itertools import combinations
-import random
+from sklearn.preprocessing import StandardScaler
 import joblib
 import datetime
 import requests
