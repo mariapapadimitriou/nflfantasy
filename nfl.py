@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import os
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OrdinalEncoder
+from sklearn.preprocessing import OrdinalEncoder, OneHotEncoder
 from sklearn.compose import ColumnTransformer
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report, log_loss, roc_auc_score, f1_score
 from sklearn.preprocessing import StandardScaler
@@ -83,9 +83,14 @@ def get_rolling_yards(group):
     group['rolling_yapg'] = group['yards_gained'].shift(1).rolling(window=4, min_periods=1).mean()
     return group
 
+def get_qb_rolling_stats(group):
+    group['qb_rolling_passing_tds'] = group['passing_tds'].rolling(window=4, min_periods=1).mean().shift(1)
+    group['qb_rolling_passing_yards'] = group['passing_yards'].rolling(window=4, min_periods=1).mean().shift(1)
+    return group
+
 def trainModel(df, season, week):
     
-    features = ['home', 'prev_receiving_touchdowns', 'prev_receiving_yards', 'prev_rushing_touchdowns', 'prev_rushing_yards', 'report_status', 'rolling_receiving_touchdowns', 'rolling_receiving_yards', 'rolling_rushing_touchdowns', 'rolling_rushing_yards', 'rookie', 'wp', 'rolling_red_zone', 'rolling_yapg', "prev_red_zone"]
+    features = ['home', 'prev_receiving_touchdowns', 'prev_receiving_yards', 'prev_rushing_touchdowns', 'prev_rushing_yards', 'report_status', 'rolling_receiving_touchdowns', 'rolling_receiving_yards', 'rolling_rushing_touchdowns', 'rolling_rushing_yards', 'rookie', 'wp', 'rolling_red_zone', 'rolling_yapg', "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
 
     X = df[["player_id"] + features]
 
@@ -96,8 +101,9 @@ def trainModel(df, season, week):
     X = X.drop('player_id', axis=1)
     
     ordinal_features = ["report_status"]
-    numeric_features = df[features].select_dtypes(include=['number']).columns.tolist()
-    
+    numeric_features = ['prev_receiving_touchdowns', 'prev_receiving_yards', "prev_rushing_touchdowns", 'prev_rushing_yards', "rolling_receiving_touchdowns", "rolling_receiving_yards", "rolling_rushing_touchdowns",  "rolling_rushing_yards", "wp", "rolling_red_zone", "rolling_yapg", "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
+    #categorical_features = ["qb_id"]
+
     report_status_order = ["Healthy", "Minor", 'Questionable', 'Doubtful', 'Out']
     
     imputer = SimpleImputer(strategy='mean')
@@ -109,6 +115,7 @@ def trainModel(df, season, week):
     encoder = ColumnTransformer(
         transformers=[
             ('ordinal', OrdinalEncoder(categories=[report_status_order]), ordinal_features),
+            #('onehot', OneHotEncoder(), categorical_features)
         ],
         remainder='passthrough'
     )
@@ -171,6 +178,8 @@ def trainModel(df, season, week):
     joblib.dump(encoder, f"Model/encoder-{season}-{week}.pkl")
     
     y_pred_binary = [1 if prob > threshold else 0 for prob in y_pred_prob]
+
+    print(classification_report(y_test, y_pred_binary))
     
     return classification_report(y_test, y_pred_binary)
 
@@ -266,19 +275,21 @@ def load_data(season, week):
     injuries_summary = injuries[["season", "week", "gsis_id", "report_status"]]
     injuries_summary["report_status"] = np.where(injuries_summary["report_status"].isna(), "Minor", injuries_summary["report_status"])
 
-    games = game_data[["season", "week", "home_moneyline", "game_id", "home_team", "away_team"]]
+    games = game_data[["season", "week", "home_moneyline", "game_id", "home_team", "away_team", "home_qb_id", "away_qb_id"]]
     games["home_wp"] = games["home_moneyline"].apply(american_odds_to_probability)
 
     home_games = pd.merge(roster_summary, games, how='left', left_on=["season", "team"], right_on=["season", "home_team"]).dropna()
     home_games["home"] = 1
+    home_games["qb_id"] = home_games["home_qb_id"]
     away_games = pd.merge(roster_summary, games, how='left', left_on=["season", "team"], right_on=["season", "away_team"]).dropna()
     away_games["home"] = 0
+    away_games["qb_id"] = away_games["away_qb_id"]
 
     games = pd.concat([away_games, home_games])
 
     games = games[games.status == 'ACT']
 
-    df = games[["player_id", "player_name", "game_id", "team", "season", "week", "rookie", "home_team", "away_team", "home_wp", "home"]]
+    df = games[["player_id", "player_name", "game_id", "team", "season", "week", "rookie", "home_team", "away_team", "home_wp", "home", "qb_id"]]
 
     mdf = pd.merge(df, touchdowns, how='left', left_on=['player_id', 'game_id'], right_on=['td_player_id', 'game_id'], indicator=True)
 
@@ -316,6 +327,16 @@ def load_data(season, week):
     df = df.groupby(['player_id']).apply(calculate_rolling_avg)
 
     df = df.drop(["rushing_yards", "rushing_tds",	"receiving_yards",	"receiving_tds",	"passing_tds", "passing_yards"], axis=1)
+
+    qbs = df["qb_id"].unique()
+
+    qb_weekly_stats = weekly_stats[weekly_stats['player_id'].isin(qbs)][["player_id", "season", "week", "passing_tds", "passing_yards"]]
+
+    df = pd.merge(df, qb_weekly_stats, left_on=['qb_id', 'season', 'week'], right_on=['player_id', 'season', 'week'], how='left', suffixes=('', '_drop'))
+
+    df = df.sort_values(by=['qb_id', 'season', 'week'])
+
+    df = df.groupby(['qb_id']).apply(get_qb_rolling_stats)
 
     df = pd.merge(df, season_stats_load[["player_id", "season", "rushing_yards", "rushing_tds", "receiving_yards", "receiving_tds"]], how='left', on=["player_id", "season"])
 
@@ -393,7 +414,7 @@ def load_data_from_csv(season, week):
 # Function to simulate prediction (can return a DataFrame)
 def predict_week(season, week, current_week):
     
-    features = ['home', 'prev_receiving_touchdowns', 'prev_receiving_yards', 'prev_rushing_touchdowns', 'prev_rushing_yards', 'report_status', 'rolling_receiving_touchdowns', 'rolling_receiving_yards', 'rolling_rushing_touchdowns', 'rolling_rushing_yards', 'rookie', 'wp', 'rolling_red_zone', 'rolling_yapg', "prev_red_zone"]
+    features = ['home', 'prev_receiving_touchdowns', 'prev_receiving_yards', 'prev_rushing_touchdowns', 'prev_rushing_yards', 'report_status', 'rolling_receiving_touchdowns', 'rolling_receiving_yards', 'rolling_rushing_touchdowns', 'rolling_rushing_yards', 'rookie', 'wp', 'rolling_red_zone', 'rolling_yapg', "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
     
     new_data = current_week
 
@@ -408,8 +429,8 @@ def predict_week(season, week, current_week):
     scaler = joblib.load(f"Model/scaler-{season}-{week}.pkl")
     encoder = joblib.load(f"Model/encoder-{season}-{week}.pkl")
 
-    numeric_features = current_week[features].select_dtypes(include=['number']).columns.tolist()
-
+    numeric_features = ['prev_receiving_touchdowns', 'prev_receiving_yards', "prev_rushing_touchdowns", 'prev_rushing_yards', "rolling_receiving_touchdowns", "rolling_receiving_yards", "rolling_rushing_touchdowns",  "rolling_rushing_yards", "wp", "rolling_red_zone", "rolling_yapg", "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
+    
     X[numeric_features] = imputer.transform(X[numeric_features])
     X[numeric_features] = scaler.transform(X[numeric_features])
 
@@ -463,17 +484,20 @@ def retrain_model(season, week, df):
 
 app = dash.Dash(__name__, title="NFL Touchdown Predictions", external_stylesheets=['https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap'])
 app.layout = html.Div([
-    html.H1("NFL Touchdown Predictions", style={'fontFamily': 'Roboto', 'color': '#43dae5'}),
+    html.H1("NFL Touchdown Predictions", style={'fontFamily': 'Roboto', 'color': '#4cc9f0', 'textAlign': 'center'}),
 
-    dcc.Input(id='input-season', type='number', placeholder='Enter season (e.g. 2023)', min=2020, max=2050, 
-              style={'backgroundColor': '#223436', 'color': '#43dae5', 'border': '1px solid #43dae5', 'fontFamily': 'Roboto'}),
-    dcc.Input(id='input-week', type='number', placeholder='Enter week (1-20)', min=1, max=20,
-              style={'backgroundColor': '#223436', 'color': '#43dae5', 'border': '1px solid #43dae5', 'fontFamily': 'Roboto'}),
+    html.Div([
+        dcc.Input(id='input-season', type='number', placeholder='Enter season (e.g. 2023)', min=2020, max=2050, 
+                  style={'backgroundColor': '#4361ee', 'color': 'white', 'border': '1px solid #7209b7', 'borderRadius': '5px', 'marginRight': '10px'}),
+        dcc.Input(id='input-week', type='number', placeholder='Enter week (1-20)', min=1, max=20, 
+                  style={'backgroundColor': '#4361ee', 'color': 'white', 'border': '1px solid #7209b7', 'borderRadius': '5px'})
+    ], style={'padding': '10px 0'}),
 
-    html.Button('Load Data', id='load-data-btn', style={'marginRight': '10px', 'backgroundColor': '#43dae5', 'color': '#121212', 'fontFamily': 'Roboto'}),
-    html.Button('Predict Week', id='predict-week-btn', style={'marginRight': '10px', 'backgroundColor': '#43dae5', 'color': '#121212', 'fontFamily': 'Roboto'}),
-    html.Button('Retrain Model', id='retrain-model-btn', 
-                style={'backgroundColor': 'transparent', 'border': '2px solid #43dae5', 'color': '#43dae5', 'fontFamily': 'Roboto'}),
+    html.Div([
+        html.Button('Load Data', id='load-data-btn', style={'backgroundColor': '#f72585', 'color': 'white', 'border': 'none', 'borderRadius': '5px', 'padding': '10px', 'marginRight': '10px'}),
+        html.Button('Predict Week', id='predict-week-btn', style={'backgroundColor': '#7209b7', 'color': 'white', 'border': 'none', 'borderRadius': '5px', 'padding': '10px', 'marginRight': '10px'}),
+        html.Button('Retrain Model', id='retrain-model-btn', style={'backgroundColor': 'transparent', 'border': '2px solid #4cc9f0', 'color': '#4cc9f0', 'borderRadius': '5px', 'padding': '10px'})
+    ], style={'padding': '10px 0'}),
 
     # ConfirmDialog to ask the user for confirmation before retraining the model
     dcc.ConfirmDialog(
@@ -481,50 +505,51 @@ app.layout = html.Div([
         message='A model has already been trained on data previous to this season and week. Are you sure you want to overwrite it?',
     ),
 
-    html.Div(id='output-message', style={'color': '#43dae5', 'fontFamily': 'Roboto'}),
+    html.Div(id='output-message', style={'color': 'white', 'padding': '10px 0'}),
+
     dcc.Loading(
         id='loading',
         type='default',
         children=[
-             dash_table.DataTable(
+            dash_table.DataTable(
                 id='output-table',
                 columns=[],  # Columns will be set dynamically
                 data=[],     # Data will be set dynamically
                 style_header={
-                    'backgroundColor': '#223436',  # Dark header background
-                    'color': '#43dae5',  # Light blue text
+                    'backgroundColor': '#7209b7',  # Dark header background
+                    'color': 'white',  # White text
                     'fontWeight': 'bold',
-                    'border': '1px solid #43dae5'
+                    'border': '1px solid #4cc9f0'  # Accent border
                 },
                 style_data={
-                    'backgroundColor': '#121212',  # Dark background for cells
+                    'backgroundColor': '#3a0ca3',  # Dark background for cells
                     'color': '#e0e0e0',  # Light text color
-                    'border': '1px solid #43dae5'
+                    'border': '1px solid #4cc9f0',  # Border between cells
                 },
                 style_cell={
                     'fontFamily': 'Roboto',  # Use Roboto font
                     'fontSize': '14px',
                     'padding': '10px',  # Add some padding to cells
                     'textAlign': 'left',
-                    'border': '1px solid #43dae5'  # Border for each cell
+                    'border': '1px solid #4cc9f0'  # Border for each cell
                 },
-                style_data_conditional=[
+                style_data_conditional=[  # Optional: hover effects
                     {
                         'if': {'state': 'active'},
-                        'backgroundColor': '#223436',
-                        'border': '1px solid #43dae5',
+                        'backgroundColor': '#7209b7',
+                        'border': '1px solid #4361ee',
                     },
                     {
                         'if': {'state': 'selected'},
-                        'backgroundColor': '#223436',
-                        'border': '1px solid #43dae5',
+                        'backgroundColor': '#f72585',
+                        'border': '1px solid #4361ee',
                     }
                 ],
                 style_table={'overflowX': 'auto'},  # To handle wide tables
-             )
+            )
         ]
     )
-], style={'backgroundColor': '#121212'})  # Overall dark background
+], style={'backgroundColor': '#3a0ca3', 'padding': '20px', 'minHeight': '100vh'})
 
 df, current_week = None, None
 
