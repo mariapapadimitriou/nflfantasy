@@ -25,6 +25,10 @@ import json
 import pandas as pd
 
 
+features = ['home','prev_receiving_touchdowns', 'prev_receiving_yards', 'prev_rushing_touchdowns', 'prev_rushing_yards', 'report_status', 'rolling_receiving_touchdowns', 'rolling_receiving_yards', 'rolling_rushing_touchdowns', 'rolling_rushing_yards', 'rookie', 'wp', 'rolling_red_zone', 'rolling_yapg', "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
+
+numeric_features = ['prev_receiving_touchdowns', 'prev_receiving_yards', "prev_rushing_touchdowns", 'prev_rushing_yards', "rolling_receiving_touchdowns", "rolling_receiving_yards", "rolling_rushing_touchdowns",  "rolling_rushing_yards", "wp", "rolling_red_zone", "rolling_yapg", "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
+
 def american_odds_to_probability(odds):
     if odds > 0:
         return 100 / (odds + 100)
@@ -54,6 +58,7 @@ def match_teams(team, choices, scorer=process.extractOne):
 def pull_data_for_season_date(date):
     url = "https://www.teamrankings.com/nfl/stat/opponent-red-zone-scoring-pct?date={date}".format(date=date.strftime('%Y-%m-%d'))
 
+    print(url)
     try:
         tables = pd.read_html(url)
         df = tables[0]
@@ -90,8 +95,6 @@ def get_qb_rolling_stats(group):
 
 def trainModel(df, season, week):
     
-    features = ['home', 'prev_receiving_touchdowns', 'prev_receiving_yards', 'prev_rushing_touchdowns', 'prev_rushing_yards', 'report_status', 'rolling_receiving_touchdowns', 'rolling_receiving_yards', 'rolling_rushing_touchdowns', 'rolling_rushing_yards', 'rookie', 'wp', 'rolling_red_zone', 'rolling_yapg', "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
-
     X = df[["player_id"] + features]
 
     y = df['touchdown']
@@ -101,8 +104,6 @@ def trainModel(df, season, week):
     X = X.drop('player_id', axis=1)
     
     ordinal_features = ["report_status"]
-    numeric_features = ['prev_receiving_touchdowns', 'prev_receiving_yards', "prev_rushing_touchdowns", 'prev_rushing_yards', "rolling_receiving_touchdowns", "rolling_receiving_yards", "rolling_rushing_touchdowns",  "rolling_rushing_yards", "wp", "rolling_red_zone", "rolling_yapg", "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
-    #categorical_features = ["qb_id"]
 
     report_status_order = ["Healthy", "Minor", 'Questionable', 'Doubtful', 'Out']
     
@@ -180,28 +181,38 @@ def trainModel(df, season, week):
     y_pred_binary = [1 if prob > threshold else 0 for prob in y_pred_prob]
 
     print(classification_report(y_test, y_pred_binary))
+
+    print(confusion_matrix(y_test, y_pred_binary))
     
     return classification_report(y_test, y_pred_binary)
 
 # Function to simulate loading data
 def load_data(season, week):
+
     years = list(range(season-2, season+1))
 
-    player_stats_load = nfl.import_seasonal_data(years)
-    pbp_load = nfl.import_pbp_data([2021] + years)
+    years_adj = years
+
+    if week == 1:
+        years_adj = list(range(season-3, season))
+
+    player_stats_load = nfl.import_seasonal_data(years_adj)
+    pbp_load = nfl.import_pbp_data(years_adj)
+    injuries_load = nfl.import_injuries(years_adj)
+    weekly_stats_load = nfl.import_weekly_data(years_adj, columns=["player_id", "season", "week", "rushing_yards", "rushing_tds", "receiving_yards", "receiving_tds", "passing_tds", "passing_yards"])
+    season_stats_load = nfl.import_seasonal_data(years_adj)
+    played_load = nfl.import_weekly_data(years_adj)
+
     roster_load = nfl.import_seasonal_rosters(years)
-    injuries_load = nfl.import_injuries(years)
     game_data_load = nfl.import_schedules(years)
-    weekly_stats_load = nfl.import_weekly_data([2021] + years, columns=["player_id", "season", "week", "rushing_yards", "rushing_tds", "receiving_yards", "receiving_tds", "passing_tds", "passing_yards"])
-    season_stats_load = nfl.import_seasonal_data([2021] + years)
-    played_load = nfl.import_weekly_data(years)
     team_names = nfl.import_team_desc()
 
     season_start_dates = {
         2021: datetime.datetime(2021, 9, 9),  # Example start date: September 9, 2021
         2022: datetime.datetime(2022, 9, 8),  # September 8, 2022
         2023: datetime.datetime(2023, 9, 7),  # September 7, 2023
-        2024: datetime.datetime(2024, 9, 5)   # September 5, 2024
+        2024: datetime.datetime(2024, 9, 5),   # September 5, 2024
+        2025: datetime.datetime(2025, 9, 3)   # September 3, 2025
     }
 
     weeks_in_season = 18
@@ -241,6 +252,7 @@ def load_data(season, week):
         2021: 'https://www.teamrankings.com/nfl/stat/opponent-red-zone-scoring-pct?date=2022-03-01',
         2022: 'https://www.teamrankings.com/nfl/stat/opponent-red-zone-scoring-pct?date=2023-03-01',
         2023: 'https://www.teamrankings.com/nfl/stat/opponent-red-zone-scoring-pct?date=2024-03-01',
+        2024: 'https://www.teamrankings.com/nfl/stat/opponent-red-zone-scoring-pct?date=2025-03-01',
         }
 
     red_zone_data_load = pd.DataFrame()
@@ -289,7 +301,7 @@ def load_data(season, week):
 
     games = games[games.status == 'ACT']
 
-    df = games[["player_id", "player_name", "game_id", "team", "season", "week", "rookie", "home_team", "away_team", "home_wp", "home", "qb_id"]]
+    df = games[["player_id", "position", "player_name", "game_id", "team", "season", "week", "rookie", "home_team", "away_team", "home_wp", "home", "qb_id"]]
 
     mdf = pd.merge(df, touchdowns, how='left', left_on=['player_id', 'game_id'], right_on=['td_player_id', 'game_id'], indicator=True)
 
@@ -372,6 +384,10 @@ def load_data(season, week):
 
     df = df.drop(["Team", "team_name", "team_abbr"], axis=1)
 
+    df.loc[df['position'] == 'QB', ['qb_rolling_passing_yards', 'qb_rolling_passing_tds']] = 0
+
+    #df = df[df.season > 2022]
+
     # Below is for runing the model in real time
 
     current_week = df[(df.season == season) & (df.week == week)]
@@ -395,6 +411,8 @@ def load_data(season, week):
     date_str = pd.Timestamp.now().strftime('%Y-%m-%d')
     df.to_csv(f'Historical/df_{season}_{week}_{date_str}.csv', index=False)
     current_week.to_csv(f'Historical/current_week_{season}_{week}_{date_str}.csv', index=False)
+
+    print(df)
     
     return f"Data for season {season}, week {week} has been loaded.", df, current_week
 
@@ -413,9 +431,7 @@ def load_data_from_csv(season, week):
 
 # Function to simulate prediction (can return a DataFrame)
 def predict_week(season, week, current_week):
-    
-    features = ['home', 'prev_receiving_touchdowns', 'prev_receiving_yards', 'prev_rushing_touchdowns', 'prev_rushing_yards', 'report_status', 'rolling_receiving_touchdowns', 'rolling_receiving_yards', 'rolling_rushing_touchdowns', 'rolling_rushing_yards', 'rookie', 'wp', 'rolling_red_zone', 'rolling_yapg', "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
-    
+       
     new_data = current_week
 
     X = new_data[["player_id"] + features]
@@ -428,8 +444,6 @@ def predict_week(season, week, current_week):
     imputer = joblib.load(f"Model/imputer-{season}-{week}.pkl")
     scaler = joblib.load(f"Model/scaler-{season}-{week}.pkl")
     encoder = joblib.load(f"Model/encoder-{season}-{week}.pkl")
-
-    numeric_features = ['prev_receiving_touchdowns', 'prev_receiving_yards', "prev_rushing_touchdowns", 'prev_rushing_yards', "rolling_receiving_touchdowns", "rolling_receiving_yards", "rolling_rushing_touchdowns",  "rolling_rushing_yards", "wp", "rolling_red_zone", "rolling_yapg", "prev_red_zone", "qb_rolling_passing_tds", "qb_rolling_passing_yards"]
     
     X[numeric_features] = imputer.transform(X[numeric_features])
     X[numeric_features] = scaler.transform(X[numeric_features])
@@ -468,10 +482,17 @@ def predict_week(season, week, current_week):
         'probability': filtered_list_all_values
     })
 
+    y_pred_binary = [1 if prob > 0.5 else 0 for prob in final_df["probability"]]
+
+    if len(final_df["touchdown"].value_counts()) > 0:   
+        print(classification_report(final_df["touchdown"], y_pred_binary))
+        print(confusion_matrix(final_df["touchdown"], y_pred_binary))
+
     return output
 
 # Function to simulate model retraining
 def retrain_model(season, week, df):
+
     
     model_filename = f"model-{season}-{week}.json"
     if os.path.exists(model_filename):
@@ -481,8 +502,8 @@ def retrain_model(season, week, df):
         trainModel(df, season, week)
         return True, f"Model (using data prior to season {season}, week {week}) has been retrained and saved."
 
-
 app = dash.Dash(__name__, title="NFL Touchdown Predictions", external_stylesheets=['https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap'])
+
 app.layout = html.Div([
     html.H1("NFL Touchdown Predictions", style={'fontFamily': 'Roboto', 'color': '#43dae5', 'textAlign': 'center'}),
 
@@ -492,14 +513,14 @@ app.layout = html.Div([
                   style={'backgroundColor': '#223436', 'color': '#43dae5', 'border': '1px solid #43dae5', 'fontFamily': 'Roboto', 'padding': '10px', 'marginRight': '10px'}),
         dcc.Input(id='input-week', type='number', placeholder='Enter week (1-20)', min=1, max=20,
                   style={'backgroundColor': '#223436', 'color': '#43dae5', 'border': '1px solid #43dae5', 'fontFamily': 'Roboto', 'padding': '10px'}),
-    ], style={'display': 'flex', 'justifyContent': 'center', 'marginBottom': '20px'}),  # Center the inputs
+    ], style={'display': 'flex', 'justifyContent': 'center', 'marginBottom': '20px'}),
 
     # Buttons
     html.Div([
         html.Button('Load Data', id='load-data-btn', style={'backgroundColor': '#43dae5', 'color': '#121212', 'fontFamily': 'Roboto', 'border': 'none', 'padding': '10px', 'marginRight': '10px'}),
         html.Button('Predict Week', id='predict-week-btn', style={'backgroundColor': '#43dae5', 'color': '#121212', 'fontFamily': 'Roboto', 'border': 'none', 'padding': '10px', 'marginRight': '10px'}),
-        html.Button('Retrain Model', id='retrain-model-btn', 
-                    style={'backgroundColor': 'transparent', 'border': '2px solid #43dae5', 'color': '#43dae5', 'fontFamily': 'Roboto', 'padding': '10px'}),
+        html.Button('Retrain Model', id='retrain-model-btn', style={'backgroundColor': 'transparent', 'border': '2px solid #43dae5', 'color': '#43dae5', 'fontFamily': 'Roboto', 'padding': '10px', 'marginRight': '10px'}),
+        html.Button('Export Data', id='export-btn', style={'backgroundColor': '#43dae5', 'color': '#121212', 'fontFamily': 'Roboto', 'border': 'none', 'padding': '10px'}),
     ], style={'display': 'flex', 'justifyContent': 'center', 'marginBottom': '20px'}),
 
     # ConfirmDialog to ask the user for confirmation before retraining the model
@@ -516,7 +537,7 @@ app.layout = html.Div([
         id='loading',
         type='default',
         children=[
-             dash_table.DataTable(
+            dash_table.DataTable(
                 id='output-table',
                 columns=[],  # Columns will be set dynamically
                 data=[],     # Data will be set dynamically
@@ -532,11 +553,11 @@ app.layout = html.Div([
                     'border': '1px solid #43dae5'
                 },
                 style_cell={
-                    'fontFamily': 'Roboto',  # Use Roboto font
+                    'fontFamily': 'Roboto',
                     'fontSize': '14px',
-                    'padding': '10px',  # Add some padding to cells
+                    'padding': '10px',
                     'textAlign': 'left',
-                    'border': '1px solid #43dae5'  # Border for each cell
+                    'border': '1px solid #43dae5'
                 },
                 style_data_conditional=[
                     {
@@ -550,81 +571,91 @@ app.layout = html.Div([
                         'border': '1px solid #43dae5',
                     }
                 ],
-                style_table={'overflowX': 'auto'},  # To handle wide tables
-             )
+                style_table={'overflowX': 'auto'},
+            )
         ]
-    )
+    ),
+
+    # Download component for exporting CSV
+    dcc.Download(id="download-dataframe-csv")
 ], style={'backgroundColor': '#121212', 'height': '100vh', 'padding': '20px'})  # Overall dark background
 
-df, current_week = None, None
+df, current_week, df_predicted = None, None, None
 
+# Define the callback function
 @app.callback(
     [Output('output-message', 'children'),
      Output('output-table', 'columns'),
      Output('output-table', 'data'),
-     Output('confirm-retrain-dialog', 'displayed')],
+     Output('confirm-retrain-dialog', 'displayed'),
+     Output("download-dataframe-csv", "data")],
     [Input('load-data-btn', 'n_clicks'),
      Input('predict-week-btn', 'n_clicks'),
      Input('retrain-model-btn', 'n_clicks'),
-     Input('confirm-retrain-dialog', 'submit_n_clicks')],
+     Input('confirm-retrain-dialog', 'submit_n_clicks'),
+     Input('export-btn', 'n_clicks')],
     [State('input-season', 'value'),
      State('input-week', 'value')]
 )
-def handle_buttons(load_clicks, predict_clicks, retrain_clicks, confirm_retrain_clicks, season, week):
-    global df, current_week
+def handle_buttons(load_clicks, predict_clicks, retrain_clicks, confirm_retrain_clicks, export_clicks, season, week):
+    global df, current_week, df_predicted
     ctx = dash.callback_context
+
+    # Initialize the export data as None
+    export_data = None
 
     # Check if any button is clicked
     if not ctx.triggered:
-        return "", [], [], False  # No button clicked yet
+        return "", [], [], False, None
 
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
 
     # General validation for season and week inputs
     if not season or not week:
-        return "Please enter both season and week to proceed.", [], [], False
+        return "Please enter both season and week to proceed.", [], [], False, None
 
     # Handle Load Data Button
     if button_id == 'load-data-btn':
         message, df, current_week = load_data_from_csv(season, week)
         if message is None:
             message, df, current_week = load_data(season, week)
-        return message, [], [], False
+        return message, [], [], False, None
 
     # Handle Predict Week Button
     elif button_id == 'predict-week-btn':
         if current_week is not None:
             df_predicted = predict_week(season, week, current_week)
             columns = [{'name': i, 'id': i} for i in df_predicted.columns]
-            return "", columns, df_predicted.to_dict('records'), False
+            return "", columns, df_predicted.to_dict('records'), False, None
         else:
-            return "Data not loaded. Please load the data first before predicting.", [], [], False
+            return "Data not loaded. Please load the data first before predicting.", [], [], False, None
 
     # Handle Retrain Model Button
     elif button_id == 'retrain-model-btn':
         model_path = f"Model/xgboost_model-{season}-{week}.json"
 
         if os.path.exists(model_path):
-
-            return "", [], [], True
+            return "", [], [], True, None
 
         # No existing model found, retrain directly
         elif df is not None:
             success, message = retrain_model(season, week, df)
-            return message, [], [], False
+            return message, [], [], False, None
         else:
-            return "Data not loaded. Please load the data first before retraining the model.", [], [], False
+            return "Data not loaded. Please load the data first before retraining the model.", [], [], False, None
 
     elif button_id == 'confirm-retrain-dialog' and confirm_retrain_clicks:
         if df is not None:
             success, message = retrain_model(season, week, df)
-            return message, [], [], False
+            return message, [], [], False, None
 
-    return "", [], [], False 
+    # Handle Export Button
+    elif button_id == 'export-btn' and df_predicted is not None:
+        export_data = dcc.send_data_frame(df_predicted.to_csv, "predicted_week_data.csv")
 
-if __name__ == '__main__':
-    app.run_server(debug=True)
+    return "", [], [], False, export_data
 
+# Helper functions (load_data_from_csv, predict_week, load_data, retrain_model) should be defined here.
 
 app.index_string = '''
 <!DOCTYPE html>
@@ -646,7 +677,9 @@ app.index_string = '''
 </html>
 '''
 
+# Set up server
 server = app.server
 
+# Run the server
 if __name__ == '__main__':
     app.run_server(debug=True)
