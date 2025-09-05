@@ -386,7 +386,6 @@ def load_data(season, week):
 
     df.loc[df['position'] == 'QB', ['qb_rolling_passing_yards', 'qb_rolling_passing_tds']] = 0
 
-    #df = df[df.season > 2022]
 
     # Below is for runing the model in real time
 
