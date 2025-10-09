@@ -44,13 +44,11 @@ def get_qb_rolling_stats(df):
     return df
 
 def american_odds_to_probability(odds):
-    try:
-        if odds > 0:
-            return 100 / (odds + 100)
-        else:
-            return -odds / (-odds + 100)
-    except Exception:
-        return np.nan
+    odds = int(odds)
+    if odds > 0:
+        return 100 / (odds + 100)
+    else:
+        return -odds / (-odds + 100)
 
 def compute_red_zone_stats(pbp: pd.DataFrame) -> tuple:
     pbp['is_red_zone'] = pbp['yardline_100'] <= 20
