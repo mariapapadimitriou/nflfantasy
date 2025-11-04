@@ -292,3 +292,202 @@ header h1 {
     }
 }
 
+/* Clickable table rows */
+.clickable-row {
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.clickable-row:hover {
+    background-color: #2a3d3f !important;
+}
+
+/* View Details button */
+.btn-details {
+    background-color: #43dae5;
+    color: #121212;
+    border: none;
+    padding: 6px 12px;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+    transition: background-color 0.2s;
+}
+
+.btn-details:hover {
+    background-color: #35b8c2;
+}
+
+/* Modal styles */
+.modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    overflow: auto;
+    background-color: rgba(0, 0, 0, 0.8);
+}
+
+.modal-content {
+    background-color: #1e1e1e;
+    margin: 5% auto;
+    padding: 30px;
+    border: 1px solid #43dae5;
+    border-radius: 8px;
+    width: 90%;
+    max-width: 800px;
+    max-height: 80vh;
+    overflow-y: auto;
+    position: relative;
+}
+
+.close-modal {
+    color: #aaa;
+    float: right;
+    font-size: 28px;
+    font-weight: bold;
+    position: absolute;
+    right: 20px;
+    top: 20px;
+    cursor: pointer;
+}
+
+.close-modal:hover,
+.close-modal:focus {
+    color: #43dae5;
+    text-decoration: none;
+}
+
+.modal-content h2 {
+    color: #43dae5;
+    margin-bottom: 20px;
+    padding-right: 40px;
+}
+
+.modal-player-info {
+    background-color: #2a2a2a;
+    padding: 15px;
+    border-radius: 6px;
+    margin-bottom: 25px;
+}
+
+.player-info-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 20px;
+}
+
+.player-info-row span {
+    color: #e0e0e0;
+    font-size: 0.95rem;
+}
+
+.modal-features {
+    margin-top: 20px;
+}
+
+.features-list {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+}
+
+.feature-item {
+    background-color: #2a2a2a;
+    padding: 15px;
+    border-radius: 6px;
+    border-left: 4px solid #43dae5;
+    transition: transform 0.2s;
+}
+
+.feature-item:hover {
+    transform: translateX(5px);
+}
+
+.feature-item.positive {
+    border-left-color: #4caf50;
+}
+
+.feature-item.negative {
+    border-left-color: #f44336;
+}
+
+.feature-item.base-value {
+    border-left-color: #43dae5;
+    background-color: #1a3a3d;
+}
+
+.feature-name {
+    font-weight: 500;
+    color: #e0e0e0;
+    margin-bottom: 8px;
+    font-size: 1rem;
+}
+
+.feature-value {
+    font-size: 1.2rem;
+    font-weight: 700;
+    margin-bottom: 8px;
+}
+
+.feature-value.positive {
+    color: #4caf50;
+}
+
+.feature-value.negative {
+    color: #f44336;
+}
+
+.feature-description {
+    font-size: 0.85rem;
+    color: #999;
+    margin-top: 5px;
+}
+
+.feature-bar {
+    width: 100%;
+    height: 6px;
+    background-color: #1a1a1a;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 8px;
+}
+
+.feature-bar-fill {
+    height: 100%;
+    background-color: #43dae5;
+    transition: width 0.3s;
+}
+
+.feature-item.positive .feature-bar-fill {
+    background-color: #4caf50;
+}
+
+.feature-item.negative .feature-bar-fill {
+    background-color: #f44336;
+}
+
+.no-features {
+    color: #999;
+    text-align: center;
+    padding: 20px;
+    font-style: italic;
+}
+
+@media (max-width: 768px) {
+    .modal-content {
+        width: 95%;
+        margin: 10% auto;
+        padding: 20px;
+    }
+    
+    .player-info-row {
+        flex-direction: column;
+        gap: 10px;
+    }
+}
+

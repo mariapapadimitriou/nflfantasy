@@ -395,25 +395,28 @@ document.addEventListener('DOMContentLoaded', function() {
         
         modalFeatures.appendChild(featuresList);
         modal.style.display = 'block';
-    }
-    
-    // Close modal functionality
-    document.addEventListener('DOMContentLoaded', function() {
-        const modal = document.getElementById('feature-modal');
-        const closeBtn = document.querySelector('.close-modal');
         
+        // Set up close button event listener when modal is shown
+        const closeBtn = modal.querySelector('.close-modal');
         if (closeBtn) {
-            closeBtn.onclick = () => {
+            // Remove any existing listeners by cloning and replacing
+            const newCloseBtn = closeBtn.cloneNode(true);
+            closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
+            
+            newCloseBtn.addEventListener('click', function(e) {
+                e.stopPropagation();
                 modal.style.display = 'none';
-            };
+            });
         }
         
-        window.onclick = (event) => {
+        // Close modal when clicking outside
+        modal.addEventListener('click', function(event) {
             if (event.target === modal) {
                 modal.style.display = 'none';
             }
-        };
-    });
+        });
+    }
+    
 
     // Check for existing model on page load
     async function checkModelExists() {
