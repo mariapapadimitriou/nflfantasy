@@ -14,9 +14,13 @@ nflreadpy>=0.2.0
 # Web Application
 dash>=2.14.0
 dash-bootstrap-components>=1.5.0
+django>=5.2.0
 
 # File Storage
 pyarrow>=13.0.0
 
 # Utilities
 joblib>=1.3.0
+
+# Model Interpretation
+shap>=0.43.0
