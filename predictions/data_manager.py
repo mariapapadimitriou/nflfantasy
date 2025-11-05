@@ -328,17 +328,23 @@ class NFLDataManager:
         week,
         current_week_only=False,
     ):
-        """Process raw data into features"""
-        from .utils import calculate_rolling_avg, calculate_prev, get_qb_rolling_stats
+        """Process raw data into features - Complete Feature Overhaul"""
+        from .feature_engineering import (
+            calculate_player_features,
+            calculate_team_context_features,
+            calculate_team_shares,
+            calculate_defensive_features,
+        )
+        from .config import POSITIONS
 
-        print("[Processing] Building feature dataframe...")
+        print("[Processing] Building feature dataframe with new feature blueprint...")
         print(f"[Debug] Input data sizes:")
         print(f"  - player_stats: {len(player_stats)}")
         print(f"  - pbp: {len(pbp)}")
         print(f"  - roster: {len(roster)}")
         print(f"  - schedules: {len(schedules)}")
 
-        # Build weekly stats from player_stats (includes receptions and targets)
+        # Build weekly stats from player_stats (base stats for feature engineering)
         weekly_stats_cols = [
             "player_id",
             "season",
@@ -350,14 +356,28 @@ class NFLDataManager:
             "passing_tds",
             "passing_yards",
         ]
-        # Add receptions and targets if they exist in player_stats
+        # Add receptions and targets if they exist
         if "receptions" in player_stats.columns:
             weekly_stats_cols.append("receptions")
         if "targets" in player_stats.columns:
             weekly_stats_cols.append("targets")
+        if "carries" in player_stats.columns:
+            weekly_stats_cols.append("carries")
             
         weekly_stats = player_stats[weekly_stats_cols].copy()
         print(f"[Debug] weekly_stats: {len(weekly_stats)} records")
+        
+        # Ensure pbp has game_id, season, week for merging
+        if "game_id" not in pbp.columns and "gameId" in pbp.columns:
+            pbp = pbp.rename(columns={"gameId": "game_id"})
+        if "season" not in pbp.columns and "game_id" in pbp.columns:
+            # Try to extract season from game_id or add from schedules
+            pbp = pd.merge(
+                pbp,
+                schedules[["game_id", "season", "week"]].drop_duplicates(),
+                on="game_id",
+                how="left"
+            )
 
         # Build roster summary
         roster_summary = (
@@ -516,8 +536,9 @@ class NFLDataManager:
                     on=["player_id", "game_id", "season", "week"],
                     how="outer"
                 )
-                rz_pass_stats["red_zone_targets"] = rz_pass_stats["red_zone_targets"].fillna(0).astype(int)
-                rz_pass_stats["red_zone_receptions"] = rz_pass_stats["red_zone_receptions"].fillna(0).astype(int)
+                # Don't fillna - preserve NaN for players without red zone stats
+                rz_pass_stats["red_zone_targets"] = rz_pass_stats["red_zone_targets"].fillna(0).astype(int)  # Keep 0 for count stats
+                rz_pass_stats["red_zone_receptions"] = rz_pass_stats["red_zone_receptions"].fillna(0).astype(int)  # Keep 0 for count stats
                 rz_stats_list.append(rz_pass_stats)
             
             # Red zone carries for rushers (all rush attempts in red zone)
@@ -580,18 +601,19 @@ class NFLDataManager:
                     on=["player_id", "game_id", "season", "week"],
                     how="left"
                 )
-                df["touchdown_attempts"] = df["touchdown_attempts"].fillna(0).astype(int)
-                df["red_zone_completion_pct"] = df["red_zone_completion_pct"].fillna(0.0)
+                # Don't fillna - preserve NaN for players without red zone attempts
+                df["touchdown_attempts"] = df["touchdown_attempts"]  # Keep as int or NaN
+                df["red_zone_completion_pct"] = df["red_zone_completion_pct"]  # Keep as float or NaN
                 if "red_zone_receptions" in df.columns:
-                    df["red_zone_receptions"] = df["red_zone_receptions"].fillna(0).astype(int)
+                    df["red_zone_receptions"] = df["red_zone_receptions"]  # Keep as int or NaN
                 if "red_zone_targets" in df.columns:
-                    df["red_zone_targets"] = df["red_zone_targets"].fillna(0).astype(int)
+                    df["red_zone_targets"] = df["red_zone_targets"]  # Keep as int or NaN
             else:
-                df["touchdown_attempts"] = 0
-                df["red_zone_completion_pct"] = 0.0
+                df["touchdown_attempts"] = np.nan
+                df["red_zone_completion_pct"] = np.nan
         else:
-            df["touchdown_attempts"] = 0
-            df["red_zone_completion_pct"] = 0.0
+            df["touchdown_attempts"] = np.nan
+            df["red_zone_completion_pct"] = np.nan
         
         print(f"[Debug] df after touchdown attempts and red zone stats merge: {len(df)} records")
 
@@ -599,301 +621,142 @@ class NFLDataManager:
         df["against"] = np.where(
             df["team"] == df["home_team"], df["away_team"], df["home_team"]
         )
-        df["home"] = np.where(df["team"] == df["home_team"], 1, 0)
-        df["wp"] = np.where(
-            df["team"] == df["home_team"], df["home_wp"], 1 - df["home_wp"]
+        df["is_home"] = np.where(df["team"] == df["home_team"], 1, 0)
+        
+        # Merge weekly stats for feature engineering
+        df = pd.merge(df, weekly_stats, on=["player_id", "season", "week"], how="left")
+        print(f"[Debug] df after weekly_stats merge: {len(df)} records")
+        
+        # Use new feature engineering to calculate all player features
+        print(f"[Debug] Calculating player features with new feature engineering...")
+        # Add game_id to weekly_stats for feature engineering
+        weekly_stats_with_game = pd.merge(
+            weekly_stats,
+            df[["player_id", "game_id", "season", "week"]].drop_duplicates(),
+            on=["player_id", "season", "week"],
+            how="left"
         )
-        df = df.drop(["home_team", "away_team", "home_wp"], axis=1)
-
-        # Add injury status placeholder
-        df["report_status"] = "Healthy"
-
-        # Calculate comprehensive defensive stats
-        print(f"[Debug] Calculating defensive stats...")
+        player_features_df = calculate_player_features(player_stats, pbp, weekly_stats_with_game)
         
-        # Defensive stats per game - total yards and touchdowns allowed
-        defensive_stats = pbp.groupby(["game_id", "defteam", "season", "week"]).agg({
-            "yards_gained": "sum",
-            "touchdown": "sum",  # Touchdowns allowed
-        }).reset_index()
+        # Add team column to player_features_df for team context calculations
+        # Merge team from df to player_features_df
+        if "team" not in player_features_df.columns:
+            team_mapping = df[["player_id", "game_id", "season", "week", "team"]].drop_duplicates()
+            merge_cols = ["player_id", "season", "week"]
+            if "game_id" in player_features_df.columns:
+                merge_cols.append("game_id")
+            player_features_df = pd.merge(
+                player_features_df,
+                team_mapping,
+                on=merge_cols,
+                how="left"
+            )
+            print(f"[Debug] Added team column to player_features_df")
         
-        # Calculate passing yards allowed (yards on pass plays)
-        if "pass" in pbp.columns:
-            passing_defense = pbp[pbp["pass"] == 1].groupby(["game_id", "defteam"]).agg({
-                "yards_gained": "sum"
-            }).reset_index()
-            passing_defense = passing_defense.rename(columns={"yards_gained": "passing_yards"})
-            defensive_stats = pd.merge(defensive_stats, passing_defense, on=["game_id", "defteam"], how="left")
-            defensive_stats["passing_yards"] = defensive_stats["passing_yards"].fillna(0)
-        else:
-            defensive_stats["passing_yards"] = 0
-            
-        # Calculate rushing yards allowed (yards on rush plays)
-        if "rush" in pbp.columns:
-            rushing_defense = pbp[pbp["rush"] == 1].groupby(["game_id", "defteam"]).agg({
-                "yards_gained": "sum"
-            }).reset_index()
-            rushing_defense = rushing_defense.rename(columns={"yards_gained": "rushing_yards"})
-            defensive_stats = pd.merge(defensive_stats, rushing_defense, on=["game_id", "defteam"], how="left")
-            defensive_stats["rushing_yards"] = defensive_stats["rushing_yards"].fillna(0)
-        else:
-            defensive_stats["rushing_yards"] = 0
+        # Merge player features back (exclude base columns that are already in df)
+        # Drop base stat columns that exist in both df and player_features_df to avoid _feat suffixes
+        base_stats_to_drop = ["rushing_yards", "rushing_tds", "receiving_yards", 
+                              "receiving_tds", "passing_tds", "passing_yards",
+                              "receptions", "targets", "carries", "touches"]  # Add base stats that might cause conflicts
+        player_features_clean = player_features_df.drop(
+            columns=[col for col in base_stats_to_drop if col in player_features_df.columns], 
+            errors="ignore"
+        )
         
-        # Calculate points allowed (touchdowns * 7 as approximation)
-        defensive_stats["points_allowed"] = defensive_stats["touchdown"] * 7
+        merge_cols = ["player_id", "season", "week"]
+        if "game_id" in player_features_df.columns:
+            merge_cols.append("game_id")
         
-        # Store season/week before dropping for later use
-        defensive_stats_season_week = defensive_stats[["game_id", "season", "week"]].copy()
+        df = pd.merge(
+            df,
+            player_features_clean,
+            on=merge_cols,
+            how="left",
+            suffixes=("", "_feat")
+        )
         
-        defensive_stats = defensive_stats.drop(["season", "week"], axis=1)
-        defensive_stats.sort_values(by=["defteam", "game_id"], inplace=True)
+        # Clean up any _feat columns - if they exist, they're duplicates from the merge
+        # Drop the _feat versions since we want to keep the original columns from df
+        feat_cols = [col for col in df.columns if col.endswith('_feat')]
+        if feat_cols:
+            print(f"[Debug] Dropping {len(feat_cols)} duplicate _feat columns: {feat_cols[:5]}...")
+            df = df.drop(columns=feat_cols)
         
-        # Verify required columns exist
-        required_cols = ["yards_gained", "touchdown", "passing_yards", "rushing_yards", "points_allowed"]
-        for col in required_cols:
-            if col not in defensive_stats.columns:
-                print(f"[Warning] Missing column '{col}' in defensive_stats, adding with 0")
-                defensive_stats[col] = 0
+        print(f"[Debug] df after player features merge: {len(df)} records")
         
-        # Calculate rolling averages for defensive stats
-        for col in required_cols:
-            if col in defensive_stats.columns:
-                defensive_stats[f"rolling_def_{col}"] = (
-                    defensive_stats.groupby("defteam")[col]
-                    .rolling(window=3, min_periods=1)
-                    .mean()
-                    .shift(1)
-                    .reset_index(level=0, drop=True)
-                )
+        # Calculate team context features
+        print(f"[Debug] Calculating team context features...")
+        team_context = calculate_team_context_features(player_features_df, pbp, schedules)
         
-        # Keep original rolling_yapg for backward compatibility
-        if "rolling_def_yards_gained" in defensive_stats.columns:
-            defensive_stats["rolling_yapg"] = defensive_stats["rolling_def_yards_gained"]
-        else:
-            defensive_stats["rolling_yapg"] = 0
+        # Drop any existing team context columns from df to avoid merge conflicts
+        team_context_cols = ["team_total_red_zone_touches_ewma", "team_total_air_yards_ewma", 
+                             "team_play_volume_ewma", "team_win_probability", "spread_line"]
+        for col in team_context_cols:
+            if col in df.columns:
+                df = df.drop(columns=[col])
         
-        # Add season and week back for previous season calculations
-        # Use the season/week we stored before dropping
-        defensive_stats_with_season = pd.merge(
-            defensive_stats,
-            defensive_stats_season_week,
-            on="game_id",
+        df = pd.merge(
+            df,
+            team_context,
+            on=["team", "game_id", "season", "week"],
             how="left"
         )
         
-        # Calculate previous season defensive stats
-        print(f"[Debug] Calculating previous season defensive stats...")
-        # Make sure all required columns exist before aggregating
-        required_cols = ["yards_gained", "touchdown", "passing_yards", "rushing_yards", "points_allowed"]
-        missing_cols = [col for col in required_cols if col not in defensive_stats_with_season.columns]
-        if missing_cols:
-            print(f"[Warning] Missing columns in defensive_stats_with_season: {missing_cols}")
-            for col in missing_cols:
-                defensive_stats_with_season[col] = 0
+        # Clean up any duplicate columns with suffixes from merge
+        for col in df.columns:
+            if col.endswith('_x') or col.endswith('_y'):
+                base_col = col[:-2]  # Remove _x or _y suffix
+                if base_col in team_context.columns:
+                    # Keep the merged value (usually _x), drop the other
+                    if col.endswith('_y'):
+                        df = df.drop(columns=[col])
+                    else:
+                        # Rename _x back to original name
+                        df = df.rename(columns={col: base_col})
         
-        def_season_stats = defensive_stats_with_season.groupby(["defteam", "season"]).agg({
-            "yards_gained": "mean",
-            "touchdown": "mean",
-            "passing_yards": "mean",
-            "rushing_yards": "mean",
-            "points_allowed": "mean",
-        }).reset_index()
-        def_season_stats.columns = ["defteam", "season", "prev_def_yards_gained", 
-                                    "prev_def_touchdown", "prev_def_passing_yards",
-                                    "prev_def_rushing_yards", "prev_def_points_allowed"]
-        def_season_stats["next_season"] = def_season_stats["season"] + 1
-
+        print(f"[Debug] df after team context merge: {len(df)} records")
+        
+        # Calculate team shares
+        print(f"[Debug] Calculating team shares...")
+        df = calculate_team_shares(df, team_context)
+        print(f"[Debug] df after team shares: {len(df)} records")
+        
+        # Calculate defensive features
+        print(f"[Debug] Calculating defensive features...")
+        defensive_features = calculate_defensive_features(pbp, schedules)
         df = pd.merge(
             df,
-            defensive_stats[["game_id", "defteam", "rolling_def_yards_gained", "rolling_def_touchdown", 
-                           "rolling_def_passing_yards", "rolling_def_rushing_yards", 
-                           "rolling_def_points_allowed", "rolling_yapg"]],
+            defensive_features,
+            left_on=["against", "game_id", "season", "week"],
+            right_on=["team", "game_id", "season", "week"],
             how="left",
-            left_on=["game_id", "against"],
-            right_on=["game_id", "defteam"],
+            suffixes=("", "_def")
         )
+        df = df.drop(["team_def"], axis=1, errors="ignore")
+        print(f"[Debug] df after defensive features merge: {len(df)} records")
         
-        # Merge previous season defensive stats
-        df = pd.merge(
-            df,
-            def_season_stats[["defteam", "next_season", "prev_def_yards_gained", 
-                             "prev_def_touchdown", "prev_def_passing_yards",
-                             "prev_def_rushing_yards", "prev_def_points_allowed"]],
-            how="left",
-            left_on=["against", "season"],
-            right_on=["defteam", "next_season"],
-        )
-        df = df.drop(["defteam", "next_season"], axis=1, errors="ignore")
+        # Rename 'home' to 'is_home' for consistency with feature blueprint
+        if "home" in df.columns:
+            df["is_home"] = df["home"]
+            df = df.drop(["home"], axis=1)
         
-        # Fill missing defensive stats with 0
-        for col in ["rolling_def_yards_gained", "rolling_def_touchdown", 
-                   "rolling_def_passing_yards", "rolling_def_rushing_yards", 
-                   "rolling_def_points_allowed", "rolling_yapg",
-                   "prev_def_yards_gained", "prev_def_touchdown",
-                   "prev_def_passing_yards", "prev_def_rushing_yards",
-                   "prev_def_points_allowed"]:
-            if col in df.columns:
-                df[col] = df[col].fillna(0)
-        print(f"[Debug] df after defensive_stats merge: {len(df)} records")
-
-        # Merge weekly stats
-        df = pd.merge(df, weekly_stats, on=["player_id", "season", "week"], how="left")
-        print(f"[Debug] df after weekly_stats merge: {len(df)} records")
-
-        # Calculate rolling averages
-        print(f"[Debug] Calculating rolling averages...")
-        df = df.sort_values(by=["player_id", "season", "week"])
-        df = df.groupby(["player_id"], group_keys=False).apply(calculate_rolling_avg)
-        print(f"[Debug] df after rolling avg: {len(df)} records")
-
-        df = df.drop(
-            [
-                "rushing_yards",
-                "rushing_tds",
-                "receiving_yards",
-                "receiving_tds",
-                "passing_tds",
-                "passing_yards",
-                "receptions",
-                "targets",
-                "carries",
-                # Note: touchdown_attempts and red_zone_completion_pct are kept as features
-            ],
-            axis=1,
-            errors="ignore",
-        )
-
-        # Calculate QB rolling stats
-        print(f"[Debug] Calculating QB rolling stats...")
-        qbs = df["qb_id"].unique()
-        qb_weekly_stats = weekly_stats[weekly_stats["player_id"].isin(qbs)][
-            ["player_id", "season", "week", "passing_tds", "passing_yards"]
-        ]
-        df = pd.merge(
-            df,
-            qb_weekly_stats,
-            left_on=["qb_id", "season", "week"],
-            right_on=["player_id", "season", "week"],
-            how="left",
-            suffixes=("", "_drop"),
-        )
-        df = df.sort_values(by=["qb_id", "season", "week"])
-        df = df.groupby(["qb_id"], group_keys=False).apply(get_qb_rolling_stats)
-        print(f"[Debug] df after QB stats: {len(df)} records")
-
-        # Merge previous season stats
-        print(f"[Debug] Calculating previous season stats...")
-        # Calculate season totals from weekly_stats (which includes pbp-calculated receptions/targets)
-        season_stats_agg = {
-            "rushing_yards": "sum",
-            "rushing_tds": "sum",
-            "receiving_yards": "sum",
-            "receiving_tds": "sum",
-        }
-        # Add receptions and targets from weekly_stats
-        if "receptions" in weekly_stats.columns:
-            season_stats_agg["receptions"] = "sum"
-        if "targets" in weekly_stats.columns:
-            season_stats_agg["targets"] = "sum"
-            
-        season_stats = (
-            weekly_stats.groupby(["player_id", "season"])
-            .agg(season_stats_agg)
-            .reset_index()
-        )
+        # Add injury status placeholder (not in new features, but keep for compatibility)
+        df["report_status"] = "Healthy"
         
-        # Calculate season totals for red zone stats from main df (for accurate completion %)
-        if "red_zone_receptions" in df.columns and "red_zone_targets" in df.columns:
-            rz_season_stats = df.groupby(["player_id", "season"]).agg({
-                "red_zone_receptions": "sum",
-                "red_zone_targets": "sum"
-            }).reset_index()
-            # Calculate season red zone completion %
-            rz_season_stats["red_zone_completion_pct"] = np.where(
-                rz_season_stats["red_zone_targets"] > 0,
-                rz_season_stats["red_zone_receptions"] / rz_season_stats["red_zone_targets"],
-                0.0
-            )
-            # Merge with season_stats - rename to avoid conflict with per-game red_zone_completion_pct
-            season_stats = pd.merge(
-                season_stats,
-                rz_season_stats[["player_id", "season", "red_zone_completion_pct"]].rename(
-                    columns={"red_zone_completion_pct": "season_rz_completion_pct"}
-                ),
-                on=["player_id", "season"],
-                how="left"
-            )
-            season_stats["season_rz_completion_pct"] = season_stats["season_rz_completion_pct"].fillna(0.0)
-
-        df = pd.merge(df, season_stats, how="left", on=["player_id", "season"])
-        df = df.sort_values(by=["player_id", "season"])
+        # Clean up duplicate columns from merges
+        df = df.loc[:, ~df.columns.duplicated()]
         
-        # Calculate prev_red_zone_completion_pct from season aggregated value
-        if "season_rz_completion_pct" in df.columns:
-            df["prev_red_zone_completion_pct"] = df.groupby("player_id")["season_rz_completion_pct"].shift(1).fillna(0.0)
-            df = df.drop("season_rz_completion_pct", axis=1, errors="ignore")
-        else:
-            # Fallback: calculate from per-game value if season aggregate not available
-            df["prev_red_zone_completion_pct"] = df.groupby("player_id")["red_zone_completion_pct"].shift(1).fillna(0.0)
-        
-        df = df.groupby(["player_id"], group_keys=False).apply(calculate_prev)
-        print(f"[Debug] df after prev stats: {len(df)} records")
-
-        df = df.drop(
-            ["rushing_yards", "rushing_tds", "receiving_yards", "receiving_tds", "receptions", "targets"],
-            axis=1,
-            errors="ignore",
-        )
-
         # Clean data
         df = df.drop_duplicates()
         print(f"[Debug] df after drop_duplicates: {len(df)} records")
 
-        df.loc[~df["report_status"].isin(REPORT_STATUS_ORDER), "report_status"] = (
-            "Minor"
-        )
-        df = df[~(df.report_status == "Out")]
-        print(f"[Debug] df after removing 'Out' status: {len(df)} records")
+        # Filter out players marked as "Out" (if report_status exists)
+        if "report_status" in df.columns:
+            df.loc[~df["report_status"].isin(REPORT_STATUS_ORDER), "report_status"] = "Minor"
+            df = df[~(df.report_status == "Out")]
+            print(f"[Debug] df after removing 'Out' status: {len(df)} records")
 
-        # Merge red zone stats
-        print(f"[Debug] Merging red zone stats...")
-        if self.rz_stats_rolling is not None and self.rz_stats_prev is not None:
-            red_zone_df = self.rz_stats_rolling[
-                ["posteam", "season", "week", "rolling_red_zone"]
-            ]
-            prev_year_rz = self.rz_stats_prev[["posteam", "next_year", "prev_red_zone"]]
-
-            df = pd.merge(
-                df,
-                red_zone_df,
-                how="left",
-                left_on=["against", "season", "week"],
-                right_on=["posteam", "season", "week"],
-            )
-            df = df.drop(["posteam"], axis=1, errors="ignore")
-
-            df = pd.merge(
-                df,
-                prev_year_rz,
-                how="left",
-                left_on=["against", "season"],
-                right_on=["posteam", "next_year"],
-            )
-            df = df.drop(["posteam", "next_year"], axis=1, errors="ignore")
-        else:
-            print("[Warning] Red zone stats not available, skipping...")
-            df["rolling_red_zone"] = 0
-            df["prev_red_zone"] = 0
-
-        print(f"[Debug] df after red zone merge: {len(df)} records")
-
-        # Zero out QB stats for QB position
-        df.loc[
-            df["position"] == "QB",
-            ["qb_rolling_passing_yards", "qb_rolling_passing_tds"],
-        ] = 0
-
-        # Add played indicator
+        # Add played indicator (1 if player had stats, 0 otherwise)
         print(f"[Debug] Adding played indicator...")
         played = weekly_stats[["player_id", "season", "week"]].drop_duplicates()
         played["played"] = 1
@@ -901,6 +764,20 @@ class NFLDataManager:
         df["played"] = df["played"].fillna(0).astype(int)
         print(f"[Debug] df after played merge: {len(df)} records")
         print(f"[Debug] Played distribution: {df['played'].value_counts().to_dict()}")
+        
+        # Ensure all required features from config are present (fill missing with NaN, not 0)
+        from .config import FEATURES
+        for feature in FEATURES:
+            if feature not in df.columns:
+                print(f"[Warning] Missing feature '{feature}', adding with NaN (not 0)")
+                if feature == "position":
+                    # Position should already be there, but if not, set to unknown
+                    df[feature] = df.get("position", "UNK")
+                elif feature == "is_home":
+                    df[feature] = df.get("is_home", 0)  # Keep 0 for is_home (it's a binary flag)
+                else:
+                    df[feature] = np.nan  # Use NaN instead of 0 for missing features
 
-        print(f"[Debug] FINAL df: {len(df)} records")
+        print(f"[Debug] FINAL df: {len(df)} records, columns: {len(df.columns)}")
+        print(f"[Debug] Sample feature columns: {[col for col in df.columns if col in FEATURES][:10]}")
         return df

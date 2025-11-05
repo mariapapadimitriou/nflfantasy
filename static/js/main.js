@@ -395,27 +395,26 @@ document.addEventListener('DOMContentLoaded', function() {
         
         modalFeatures.appendChild(featuresList);
         modal.style.display = 'block';
+    }
+    
+    // Set up close button and outside click handlers using event delegation
+    document.addEventListener('click', function(event) {
+        const modal = document.getElementById('feature-modal');
+        if (!modal) return;
         
-        // Set up close button event listener when modal is shown
-        const closeBtn = modal.querySelector('.close-modal');
-        if (closeBtn) {
-            // Remove any existing listeners by cloning and replacing
-            const newCloseBtn = closeBtn.cloneNode(true);
-            closeBtn.parentNode.replaceChild(newCloseBtn, closeBtn);
-            
-            newCloseBtn.addEventListener('click', function(e) {
-                e.stopPropagation();
-                modal.style.display = 'none';
-            });
+        // Close button clicked
+        if (event.target.classList.contains('close-modal')) {
+            event.preventDefault();
+            event.stopPropagation();
+            modal.style.display = 'none';
+            return;
         }
         
-        // Close modal when clicking outside
-        modal.addEventListener('click', function(event) {
-            if (event.target === modal) {
-                modal.style.display = 'none';
-            }
-        });
-    }
+        // Clicked outside modal (on the backdrop)
+        if (event.target === modal) {
+            modal.style.display = 'none';
+        }
+    });
     
 
     // Check for existing model on page load

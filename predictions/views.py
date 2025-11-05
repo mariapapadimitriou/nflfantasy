@@ -2,11 +2,13 @@
 Django views for NFL Touchdown Predictions
 """
 import json
+import os
 from django.shortcuts import render
 from django.http import JsonResponse, HttpResponse
 from django.views.decorators.http import require_http_methods
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.contrib import messages
+from django.conf import settings
 from functools import wraps
 import pandas as pd
 import traceback
@@ -250,6 +252,96 @@ def predict_week_view(request):
         
         # Get current week data from session (NaN values will be preserved)
         current_week = pd.read_json(request.session['current_week_data'], orient='split')
+        
+        # Filter out players who haven't played (no stats) - they shouldn't be predicted
+        # Only filter if 'played' column exists
+        if 'played' in current_week.columns:
+            before_count = len(current_week)
+            current_week = current_week[current_week['played'] == 1].copy()
+            after_count = len(current_week)
+            if before_count > after_count:
+                print(f"[Filter] Removed {before_count - after_count} players with no stats (played=0) from predictions")
+        
+        # Additional filter: Remove players with no meaningful stats (all key features are NaN or 0)
+        # Even if played=1, they might have no actual usage stats
+        # This prevents players with no recent activity from getting high probabilities
+        # BUT: Be less aggressive - only filter if we have enough players to spare
+        # NOTE: EWMA features may be NaN for early weeks or players with no history, so we need to be careful
+        if len(current_week) > 0:
+            before_count = len(current_week)
+            
+            # Key usage features that indicate actual player activity
+            # These are the most important indicators of player usage
+            key_usage_features = ['targets_ewma', 'receptions_ewma', 'carries_ewma', 'touches_ewma']
+            
+            # Check if player has at least one meaningful stat (not NaN and > 0)
+            has_stats = pd.Series(False, index=current_week.index)
+            
+            # Count how many key features each player has
+            for feature in key_usage_features:
+                if feature in current_week.columns:
+                    # Player has this stat if it's not NaN and > 0
+                    has_feature = current_week[feature].notna() & (current_week[feature] > 0)
+                    has_stats = has_stats | has_feature
+            
+            # Also check for position-specific stats that might indicate activity
+            # For WR/TE: end_zone_targets_ewma
+            if 'end_zone_targets_ewma' in current_week.columns:
+                wr_te_stats = current_week['end_zone_targets_ewma'].notna() & (current_week['end_zone_targets_ewma'] > 0)
+                has_stats = has_stats | wr_te_stats
+            
+            # For RB/QB: designed_rush_attempts_ewma
+            if 'designed_rush_attempts_ewma' in current_week.columns:
+                qb_stats = current_week['designed_rush_attempts_ewma'].notna() & (current_week['designed_rush_attempts_ewma'] > 0)
+                has_stats = has_stats | qb_stats
+            
+            # For red zone activity
+            if 'red_zone_touches_ewma' in current_week.columns:
+                rz_stats = current_week['red_zone_touches_ewma'].notna() & (current_week['red_zone_touches_ewma'] > 0)
+                has_stats = has_stats | rz_stats
+            
+            # Only filter if we'll still have a reasonable number of players left after filtering
+            # Require at least 10 players or 50% of original, whichever is smaller
+            players_with_stats = has_stats.sum()
+            min_players_needed = min(10, max(1, before_count // 2))
+            
+            if players_with_stats >= min_players_needed:
+                # Keep only players with at least one meaningful stat
+                current_week = current_week[has_stats].copy()
+                after_count = len(current_week)
+                
+                if before_count > after_count:
+                    print(f"[Filter] Removed {before_count - after_count} players with no meaningful stats (all key features NaN/0) from predictions")
+                    print(f"[Filter] Remaining players: {after_count}")
+            else:
+                # If filter would remove too many players, keep them all but log a warning
+                print(f"[Warning] Filter would leave only {players_with_stats} players (need at least {min_players_needed})")
+                print(f"[Warning] Keeping all {before_count} players (may include players with no stats)")
+                print(f"[Warning] This might indicate early season (EWMA features may be NaN) or data quality issue")
+        
+        # Get full training data (all historical weeks) from session
+        if 'training_data' in request.session:
+            training_data = pd.read_json(request.session['training_data'], orient='split')
+            # Combine training data (historical) with current week data
+            full_df = pd.concat([training_data, current_week], ignore_index=True)
+            print(f"[Export] Combined dataframe: {len(training_data)} historical rows + {len(current_week)} current week rows = {len(full_df)} total rows")
+        else:
+            # If no training data, just use current week
+            full_df = current_week
+            print(f"[Export] No training data found, using only current week: {len(full_df)} rows")
+        
+        # Export full dataframe (all weeks + current week) before predictions to CSV
+        base_dir = settings.BASE_DIR if hasattr(settings, 'BASE_DIR') else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        csv_path = os.path.join(base_dir, 'df.csv')
+        full_df.to_csv(csv_path, index=False)
+        print(f"[Export] Saved full dataframe to {csv_path} with {len(full_df)} rows and {len(full_df.columns)} columns")
+        
+        # Check if we have any players to predict
+        if len(current_week) == 0:
+            return JsonResponse({
+                'success': False,
+                'message': 'No players available for prediction after filtering. All players were filtered out (no stats or no meaningful features).'
+            }, status=400)
         
         # Make predictions (returns tuple: predictions_df, shap_values)
         df_predicted, shap_values = predict_week(season, week, current_week, FEATURES, NUMERIC_FEATURES)

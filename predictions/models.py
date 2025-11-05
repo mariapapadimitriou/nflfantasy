@@ -47,6 +47,12 @@ class MLModel(models.Model):
     scaler_file = models.BinaryField()
     encoder_file = models.BinaryField()
     
+    # Position-aware imputation/scaling parameters (stored as JSON strings)
+    features_with_missing = models.TextField(null=True, blank=True)  # Features that keep NaN
+    scaler_means = models.TextField(null=True, blank=True)  # Scaling means for each feature
+    scaler_stds = models.TextField(null=True, blank=True)  # Scaling stds for each feature
+    feature_importance = models.TextField(null=True, blank=True)  # Feature importance scores (JSON)
+    
     # Model metadata
     created_at = models.DateTimeField(auto_now_add=True)
     training_records = models.IntegerField(null=True)

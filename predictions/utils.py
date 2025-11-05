@@ -17,81 +17,127 @@ def match_teams(team, abbr_list):
     return team
 
 
-def calculate_rolling_avg(df):
-    # Rolling stats for receiving/rushing touchdowns/yards
-    df["rolling_receiving_touchdowns"] = (
-        df["receiving_tds"].rolling(window=3, min_periods=1).mean().shift(1)
-    )
-    df["rolling_receiving_yards"] = (
-        df["receiving_yards"].rolling(window=3, min_periods=1).mean().shift(1)
-    )
-    df["rolling_rushing_touchdowns"] = (
-        df["rushing_tds"].rolling(window=3, min_periods=1).mean().shift(1)
-    )
-    df["rolling_rushing_yards"] = (
-        df["rushing_yards"].rolling(window=3, min_periods=1).mean().shift(1)
-    )
-    # Note: rolling_yapg is calculated from defensive stats and merged into df,
-    # so we don't calculate it here from yards_gained (which doesn't exist in player df)
+def calculate_ewma(df, alpha=0.5, ewma_weeks=3):
+    """
+    Calculate Exponentially Weighted Moving Averages with recency features.
+    Uses alpha decay to give more weight to recent games.
+    Also adds features to handle rare breakout games vs consistent performance.
     
-    # Rolling stats for receptions and targets if available
+    Note: DataFrame must be sorted by season and week before calling this function.
+    """
+    # Ensure dataframe is sorted by season and week for proper time series calculations
+    if "season" in df.columns and "week" in df.columns:
+        df = df.sort_values(by=["season", "week"]).reset_index(drop=True)
+    
+    # Helper function to calculate EWMA with shift
+    def calc_ewma(series, alpha=alpha):
+        return series.ewm(alpha=alpha, adjust=False).mean().shift(1)
+    
+    # EWMA for receiving/rushing touchdowns/yards
+    df["ewma_receiving_touchdowns"] = calc_ewma(df["receiving_tds"], alpha)
+    df["ewma_receiving_yards"] = calc_ewma(df["receiving_yards"], alpha)
+    df["ewma_rushing_touchdowns"] = calc_ewma(df["rushing_tds"], alpha)
+    df["ewma_rushing_yards"] = calc_ewma(df["rushing_yards"], alpha)
+    
+    # EWMA for receptions and targets if available
     if "receptions" in df.columns:
-        df["rolling_receptions"] = (
-            df["receptions"].rolling(window=3, min_periods=1).mean().shift(1)
-        )
+        df["ewma_receptions"] = calc_ewma(df["receptions"], alpha)
     if "targets" in df.columns:
-        df["rolling_targets"] = (
-            df["targets"].rolling(window=3, min_periods=1).mean().shift(1)
-        )
+        df["ewma_targets"] = calc_ewma(df["targets"], alpha)
     if "touchdown_attempts" in df.columns:
-        df["rolling_touchdown_attempts"] = (
-            df["touchdown_attempts"].rolling(window=3, min_periods=1).mean().shift(1)
-        )
-    # Rolling red zone completion % (3-game rolling average)
+        df["ewma_touchdown_attempts"] = calc_ewma(df["touchdown_attempts"], alpha)
+    # EWMA for red zone completion %
     if "red_zone_completion_pct" in df.columns:
-        df["rolling_red_zone_completion_pct"] = (
-            df["red_zone_completion_pct"].rolling(window=3, min_periods=1).mean().shift(1)
+        df["ewma_red_zone_completion_pct"] = calc_ewma(df["red_zone_completion_pct"], alpha)
+    
+    # Recency features to handle rare breakout games
+    # Time since last touchdown (weeks ago, 0 = last game, 1 = 2 games ago, etc.)
+    # Lower is better (more recent)
+    if "receiving_tds" in df.columns and "rushing_tds" in df.columns:
+        total_tds = df["receiving_tds"] + df["rushing_tds"]
+        # Find last game with touchdown
+        td_occurred = (total_tds > 0).astype(int)
+        
+        # Calculate weeks since last TD: for each game, count backwards to last TD
+        # Reset index to work with position-based indexing
+        df_reset = df.reset_index(drop=True)
+        td_occurred_reset = td_occurred.reset_index(drop=True)
+        
+        weeks_since = []
+        for i in range(len(df_reset)):
+            # Look backwards from current position to find last TD
+            if i == 0:
+                # First game: no history, set to max
+                weeks_since.append(ewma_weeks + 1)
+            else:
+                # Count backwards to find last TD
+                found = False
+                for j in range(i - 1, -1, -1):
+                    if td_occurred_reset.iloc[j] > 0:
+                        weeks_since.append(i - j)
+                        found = True
+                        break
+                if not found:
+                    # Never scored before, set to max
+                    weeks_since.append(ewma_weeks + 1)
+        
+        # Shift by 1 to use previous game's value for prediction
+        weeks_since_series = pd.Series(weeks_since, index=df_reset.index)
+        df["weeks_since_last_td"] = weeks_since_series.shift(1).fillna(ewma_weeks + 1)
+        
+        # Recent streak: count touchdowns in last ewma_weeks games
+        # Use rolling window to count recent touchdowns
+        recent_td_count = (
+            td_occurred.rolling(window=ewma_weeks, min_periods=1).sum().shift(1).fillna(0)
         )
+        df["recent_td_count"] = recent_td_count
+        
+        # Consistency score: how many of last ewma_weeks games had touchdowns
+        # (0 to 1, higher = more consistent)
+        df["td_consistency"] = (recent_td_count / ewma_weeks).fillna(0)
     
     return df
 
 
-def calculate_prev(df):
-    # Previous season's stats
-    df["prev_receiving_yards"] = df["receiving_yards"].shift(1)
-    df["prev_receiving_touchdowns"] = df["receiving_tds"].shift(1)
-    df["prev_rushing_yards"] = df["rushing_yards"].shift(1)
-    df["prev_rushing_touchdowns"] = df["rushing_tds"].shift(1)
+def calculate_prev_game(df):
+    """
+    Calculate previous game stats (most recent single game before current).
+    This replaces previous season stats for more recent and relevant data.
+    """
+    # Previous game's stats (shift by 1 game)
+    df["prev_game_receiving_yards"] = df["receiving_yards"].shift(1)
+    df["prev_game_receiving_touchdowns"] = df["receiving_tds"].shift(1)
+    df["prev_game_rushing_yards"] = df["rushing_yards"].shift(1)
+    df["prev_game_rushing_touchdowns"] = df["rushing_tds"].shift(1)
     
-    # Previous season's receptions and targets if available
+    # Previous game's receptions and targets if available
     if "receptions" in df.columns:
-        df["prev_receptions"] = df["receptions"].shift(1)
+        df["prev_game_receptions"] = df["receptions"].shift(1)
     if "targets" in df.columns:
-        df["prev_targets"] = df["targets"].shift(1)
-    # Previous season's red zone completion % is calculated in data_manager from season aggregate
-    # Don't calculate it here to avoid overwriting
+        df["prev_game_targets"] = df["targets"].shift(1)
     
     return df
 
 
-def get_rolling_yards(df):
-    # Defensive rolling feature
-    # Note: This function is deprecated - rolling_yapg is now calculated from defensive stats
+def get_ewma_yards(df):
+    # Defensive EWMA feature
+    # Note: This function is deprecated - ewma_yapg is now calculated from defensive stats
     # and merged into the main dataframe. Keeping for backward compatibility but it won't
     # work if yards_gained doesn't exist in df.
     if "yards_gained" in df.columns:
-        df["rolling_yapg"] = (
-            df["yards_gained"].rolling(window=3, min_periods=1).mean().shift(1)
+        df["ewma_yapg"] = (
+            df["yards_gained"].ewm(alpha=0.5, adjust=False).mean().shift(1)
         )
     return df
 
 
-def get_qb_rolling_stats(df):
-    df["qb_rolling_passing_yards"] = (
-        df["passing_yards"].rolling(window=3, min_periods=1).mean().shift(1)
+def get_qb_ewma_stats(df, alpha=0.5):
+    """Calculate EWMA for QB stats"""
+    df["qb_ewma_passing_yards"] = (
+        df["passing_yards"].ewm(alpha=alpha, adjust=False).mean().shift(1)
     )
-    df["qb_rolling_passing_tds"] = (
-        df["passing_tds"].rolling(window=3, min_periods=1).mean().shift(1)
+    df["qb_ewma_passing_tds"] = (
+        df["passing_tds"].ewm(alpha=alpha, adjust=False).mean().shift(1)
     )
     return df
 
@@ -105,10 +151,14 @@ def american_odds_to_probability(odds):
 
 
 def compute_red_zone_stats(pbp: pd.DataFrame) -> tuple:
+    """
+    Calculate red zone stats from DEFENSIVE team perspective.
+    Returns how often defenses allow touchdowns when opponents reach the red zone.
+    """
     pbp["is_red_zone"] = pbp["yardline_100"] <= 20
     red_zone_drives = (
         pbp[pbp["is_red_zone"]]
-        .groupby(["game_id", "drive", "posteam"])
+        .groupby(["game_id", "drive", "posteam", "defteam"])
         .size()
         .reset_index()
         .drop(0, axis=1)
@@ -131,17 +181,27 @@ def compute_red_zone_stats(pbp: pd.DataFrame) -> tuple:
         drive_info, on=["game_id", "drive"], how="left"
     )
 
+    # Calculate from DEFENSIVE team perspective (defteam)
+    # This represents how often the defense allows touchdowns in red zone
     rz_team_week = (
-        red_zone_drives.groupby(["posteam", "season", "week"])["red_zone_scored_td"]
+        red_zone_drives.groupby(["defteam", "season", "week"])["red_zone_scored_td"]
         .agg(["sum", "count"])
         .reset_index()
     )
     rz_team_week["red_zone_scoring_pct"] = rz_team_week["sum"] / rz_team_week["count"]
+    # Rename defteam to posteam for compatibility with existing merge code
+    rz_team_week = rz_team_week.rename(columns={"defteam": "posteam"})
 
     rz_team_week = rz_team_week.sort_values(["posteam", "season", "week"])
-    rz_team_week["rolling_red_zone"] = (
+    # Use EWMA for red zone stats
+    # Import config to get EWMA_ALPHA, but allow fallback if not available
+    try:
+        from .config import EWMA_ALPHA
+    except (ImportError, AttributeError):
+        EWMA_ALPHA = 0.5  # Default fallback
+    rz_team_week["ewma_red_zone"] = (
         rz_team_week.groupby("posteam")["red_zone_scoring_pct"]
-        .rolling(window=3, min_periods=1)
+        .ewm(alpha=EWMA_ALPHA, adjust=False)
         .mean()
         .shift(1)
         .reset_index(level=0, drop=True)

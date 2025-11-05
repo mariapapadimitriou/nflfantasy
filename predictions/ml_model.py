@@ -11,6 +11,7 @@ import optuna
 from typing import Tuple, Optional
 import io
 import tempfile
+import json
 try:
     import shap
     SHAP_AVAILABLE = True
@@ -25,7 +26,7 @@ from sklearn.impute import SimpleImputer
 from imblearn.over_sampling import SMOTE
 from sklearn.metrics import log_loss, classification_report, confusion_matrix
 
-from .config import REPORT_STATUS_ORDER, MODEL_PARAMS
+from .config import REPORT_STATUS_ORDER, MODEL_PARAMS, POSITIONS, CATEGORICAL_FEATURES
 from .models import MLModel
 
 
@@ -40,6 +41,11 @@ class NFLTouchdownModel:
         self.scaler = None
         self.encoder = None
         self.model = None
+        self.features_with_missing = []  # Features that should keep NaN for inapplicable positions
+        self.scaler_means = {}  # Store scaling means for each feature
+        self.scaler_stds = {}  # Store scaling stds for each feature
+        self.feature_importance = {}  # Store feature importance scores
+        self.feature_names = []  # Store feature names in order
 
     def model_exists(self) -> bool:
         """Check if model for this season/week exists in database"""
@@ -64,31 +70,186 @@ class NFLTouchdownModel:
         print(f"{'='*60}\n")
 
         try:
+            # Validate required columns
+            if "player_id" not in df.columns:
+                return (False, "Missing required column: player_id")
+            if "touchdown" not in df.columns:
+                return (False, "Missing required column: touchdown")
+            
+            # Filter features to only those that exist in the dataframe
+            available_features = [f for f in features if f in df.columns]
+            missing_features = [f for f in features if f not in df.columns]
+            
+            if missing_features:
+                print(f"[Warning] Missing features in dataframe: {missing_features}")
+                print(f"[Info] Using {len(available_features)} available features out of {len(features)} requested")
+            
+            if not available_features:
+                return (
+                    False,
+                    f"No features available. Missing all {len(features)} features. Available columns: {list(df.columns)[:20]}",
+                )
+            
             # Prepare data
-            X = df[["player_id"] + features].copy()
+            X = df[["player_id"] + available_features].copy()
             y = df["touchdown"].copy()
             player_ids = X["player_id"].values
             X = X.drop("player_id", axis=1)
+            
+            # Update numeric_features to only include those that exist
+            available_numeric_features = [f for f in numeric_features if f in X.columns]
 
             # Setup preprocessors
-            ordinal_features = ["report_status"]
+            # Identify categorical features that exist in the dataframe
+            categorical_features_to_encode = []
+            ordinal_categories = []
+            
+            # Check for report_status (ordinal)
+            if "report_status" in X.columns:
+                categorical_features_to_encode.append("report_status")
+                ordinal_categories.append(REPORT_STATUS_ORDER)
+            
+            # Check for position (ordinal)
+            if "position" in X.columns:
+                categorical_features_to_encode.append("position")
+                ordinal_categories.append(POSITIONS)
 
-            self.imputer = SimpleImputer(strategy="mean")
-            self.scaler = StandardScaler()
+            # Position-aware imputation strategy
+            # For features that don't apply to a position (e.g., air_yards for RBs), keep NaN
+            # XGBoost can handle missing values natively, which is better than imputing with 0
+            # This allows the model to learn that missing = feature doesn't apply
+            
+            # Define position-specific feature groups based on feature specifications
+            # WR/TE only features (receiving)
+            wr_te_features = [
+                "end_zone_targets_ewma",     # WR/TE only
+            ]
+            
+            # RB only features (rushing)
+            rb_only_features = [
+                # No RB-only features after removing yards_after_contact_ewma
+            ]
+            
+            # RB/QB features (rushing)
+            rb_qb_features = [
+                "carries_ewma",              # RB/QB only
+            ]
+            
+            # QB only features
+            qb_only_features = [
+                "designed_rush_attempts_ewma",  # QB only
+                "qb_rolling_rushing_yards_ewma",  # QB only
+                "qb_rolling_rushing_TDs_ewma",    # QB only
+            ]
+            
+            # General features (apply to all positions) - these should be imputed normally
+            # targets_ewma, receptions_ewma, touches_ewma, red_zone_touches_ewma, 
+            # red_zone_touch_share_ewma, td_streak_factor, regression_td_factor, etc.
+            
+            # Ensure we're not including categorical features in numeric processing
+            numeric_only_features = [f for f in available_numeric_features if f not in categorical_features_to_encode]
+            
+            # Validate numeric features exist
+            if not numeric_only_features:
+                print(f"[Warning] No numeric features available after filtering. Available columns: {list(X.columns)}")
+            else:
+                # Create a copy to work with
+                X_imputed = X[numeric_only_features].copy()
+                
+                # Get position column if available
+                position_col = None
+                if "position" in X.columns:
+                    position_col = X["position"]
+                
+                # Track which features should keep NaN for inapplicable positions
+                features_to_keep_nan = set()
+                
+                # For each feature, impute only for positions where it's applicable
+                for feature in numeric_only_features:
+                    if feature in X_imputed.columns:
+                        # Determine which positions this feature applies to
+                        applicable_positions = None
+                        if feature in wr_te_features:
+                            applicable_positions = ["WR", "TE"]  # WR/TE only
+                            features_to_keep_nan.add(feature)
+                        elif feature in rb_only_features:
+                            applicable_positions = ["RB"]  # RB only
+                            features_to_keep_nan.add(feature)
+                        elif feature in rb_qb_features:
+                            applicable_positions = ["RB", "QB"]  # RB/QB only
+                            features_to_keep_nan.add(feature)
+                        elif feature in qb_only_features:
+                            applicable_positions = ["QB"]  # QB only
+                            features_to_keep_nan.add(feature)
+                        
+                        if applicable_positions and position_col is not None:
+                            # Only impute for applicable positions, keep NaN for others
+                            mask = position_col.isin(applicable_positions)
+                            if mask.any():
+                                # Calculate mean only for applicable positions
+                                mean_val = X_imputed.loc[mask, feature].mean()
+                                if pd.notna(mean_val):
+                                    X_imputed.loc[mask & X_imputed[feature].isna(), feature] = mean_val
+                                else:
+                                    # If no valid values, use 0 for applicable positions
+                                    X_imputed.loc[mask & X_imputed[feature].isna(), feature] = 0
+                            # For non-applicable positions, keep NaN (XGBoost will handle it)
+                        else:
+                            # General feature (team, defense, etc.) - use mean imputation for all
+                            mean_val = X_imputed[feature].mean()
+                            if pd.notna(mean_val):
+                                X_imputed[feature] = X_imputed[feature].fillna(mean_val)
+                            else:
+                                X_imputed[feature] = X_imputed[feature].fillna(0)
+                
+                # Replace with imputed values
+                X[numeric_only_features] = X_imputed
+                
+                # Store which features should keep NaN for prediction
+                self.features_with_missing = list(features_to_keep_nan)
+                
+                # Store imputation strategy for later use
+                self.imputer = SimpleImputer(strategy="mean")  # Keep for compatibility
+                self.scaler = StandardScaler()
+                
+                # Scale the data - StandardScaler can handle NaN (it ignores them during fit, but we need to handle them)
+                # For scaling, we'll use a custom approach that handles NaN
+                for feature in numeric_only_features:
+                    if feature in X.columns:
+                        # Calculate mean and std only on non-NaN values
+                        mean_val = X[feature].mean()
+                        std_val = X[feature].std()
+                        if pd.notna(std_val) and std_val > 0:
+                            X[feature] = (X[feature] - mean_val) / std_val
+                        elif pd.notna(mean_val):
+                            # If std is 0 or NaN, just center it
+                            X[feature] = X[feature] - mean_val
+                
+                # Store scaling parameters for later
+                self.scaler_means = {feat: X[feat].mean() for feat in numeric_only_features if feat in X.columns}
+                self.scaler_stds = {feat: X[feat].std() for feat in numeric_only_features if feat in X.columns}
 
-            X[numeric_features] = self.imputer.fit_transform(X[numeric_features])
-            X[numeric_features] = self.scaler.fit_transform(X[numeric_features])
-
-            self.encoder = ColumnTransformer(
-                transformers=[
-                    (
-                        "ordinal",
-                        OrdinalEncoder(categories=[REPORT_STATUS_ORDER]),
-                        ordinal_features,
+            # Create encoder with all categorical features
+            if categorical_features_to_encode:
+                transformers = []
+                for i, cat_feature in enumerate(categorical_features_to_encode):
+                    transformers.append(
+                        (
+                            f"ordinal_{cat_feature}",
+                            OrdinalEncoder(categories=[ordinal_categories[i]]),
+                            [cat_feature],
+                        )
                     )
-                ],
-                remainder="passthrough",
-            )
+                self.encoder = ColumnTransformer(
+                    transformers=transformers,
+                    remainder="passthrough",
+                )
+            else:
+                # No categorical features, just use passthrough
+                self.encoder = ColumnTransformer(
+                    transformers=[],
+                    remainder="passthrough",
+                )
 
             X_encoded = self.encoder.fit_transform(X)
 
@@ -101,14 +262,35 @@ class NFLTouchdownModel:
                 random_state=MODEL_PARAMS["random_state"],
             )
 
+            # Handle NaN values before SMOTE (SMOTE doesn't accept NaN)
+            # XGBoost can handle NaN natively, so we'll temporarily replace NaN with a sentinel value
+            # then restore NaN after SMOTE but before XGBoost
+            print("[Training] Handling NaN values for SMOTE compatibility...")
+            NAN_SENTINEL = -999999.0  # Large negative value that XGBoost will treat as missing
+            
+            # Convert to numpy array for easier NaN handling
+            X_train_np = np.array(X_train) if not isinstance(X_train, np.ndarray) else X_train
+            X_test_np = np.array(X_test) if not isinstance(X_test, np.ndarray) else X_test
+            
+            # Replace NaN with sentinel value before SMOTE
+            X_train_np = np.where(np.isnan(X_train_np), NAN_SENTINEL, X_train_np)
+            
             # Apply SMOTE
             print("[Training] Applying SMOTE for class balancing...")
             smote = SMOTE(random_state=MODEL_PARAMS["random_state"])
-            X_train_resampled, y_train_resampled = smote.fit_resample(X_train, y_train)
+            X_train_resampled, y_train_resampled = smote.fit_resample(X_train_np, y_train)
+            
+            # Restore NaN values after SMOTE (for XGBoost to handle natively)
+            # Convert sentinel back to NaN
+            X_train_resampled = np.where(X_train_resampled == NAN_SENTINEL, np.nan, X_train_resampled)
+            
+            # Also handle test set NaN with sentinel for XGBoost
+            X_test_np = np.where(np.isnan(X_test_np), NAN_SENTINEL, X_test_np)
 
-            # Create DMatrix
-            dtrain = xgb.DMatrix(X_train_resampled, label=y_train_resampled)
-            dtest = xgb.DMatrix(X_test, label=y_test)
+            # Create DMatrix (XGBoost will handle NaN natively)
+            # Note: We use the sentinel value which XGBoost treats as missing
+            dtrain = xgb.DMatrix(X_train_resampled, label=y_train_resampled, enable_categorical=False)
+            dtest = xgb.DMatrix(X_test_np, label=y_test, enable_categorical=False)
 
             # Hyperparameter optimization with Optuna
             print("[Training] Optimizing hyperparameters with Optuna...")
@@ -154,6 +336,10 @@ class NFLTouchdownModel:
                 }
             )
 
+            # Configure XGBoost to handle missing values natively
+            # XGBoost treats NaN as missing and learns optimal split directions
+            best_params["missing"] = np.nan  # Explicitly set missing value handling
+            
             self.model = xgb.train(
                 best_params, dtrain, num_boost_round=MODEL_PARAMS["num_boost_round"]
             )
@@ -164,6 +350,10 @@ class NFLTouchdownModel:
                 1 if prob > MODEL_PARAMS["prediction_threshold"] else 0
                 for prob in y_pred_prob
             ]
+            
+            # Calculate feature importance
+            print("\n[Feature Importance] Calculating feature importance...")
+            self._calculate_feature_importance(X_encoded, available_features)
 
             print("\n[Evaluation] Model Performance:")
             print(classification_report(y_test, y_pred_binary))
@@ -201,11 +391,19 @@ class NFLTouchdownModel:
                     'imputer_file': imputer_bytes,
                     'scaler_file': scaler_bytes,
                     'encoder_file': encoder_bytes,
+                    'features_with_missing': json.dumps(self.features_with_missing),
+                    'scaler_means': json.dumps(self.scaler_means),
+                    'scaler_stds': json.dumps(self.scaler_stds),
+                    'feature_importance': json.dumps(self.feature_importance),
                     'training_records': len(df),
                 }
             )
 
             print(f"\n[Success] Model saved to database for Season {self.season}, Week {self.week}")
+            
+            # Export feature importance to CSV for analysis
+            self._export_feature_importance()
+            
             return (
                 True,
                 f"Model for Season {self.season}, Week {self.week} trained successfully!",
@@ -242,8 +440,34 @@ class NFLTouchdownModel:
             
             encoder_buffer = io.BytesIO(ml_model.encoder_file)
             self.encoder = joblib.load(encoder_buffer)
+            
+            # Load position-aware imputation/scaling parameters if available
+            if hasattr(ml_model, 'features_with_missing') and ml_model.features_with_missing:
+                self.features_with_missing = json.loads(ml_model.features_with_missing)
+            else:
+                self.features_with_missing = []
+            
+            if hasattr(ml_model, 'scaler_means') and ml_model.scaler_means:
+                self.scaler_means = json.loads(ml_model.scaler_means)
+            else:
+                self.scaler_means = {}
+            
+            if hasattr(ml_model, 'scaler_stds') and ml_model.scaler_stds:
+                self.scaler_stds = json.loads(ml_model.scaler_stds)
+            else:
+                self.scaler_stds = {}
 
             print(f"[Model] Loaded model from database for Season {self.season}, Week {self.week}")
+            
+            # Load feature importance if available
+            if hasattr(ml_model, 'feature_importance') and ml_model.feature_importance:
+                try:
+                    self.feature_importance = json.loads(ml_model.feature_importance)
+                except:
+                    self.feature_importance = {}
+            else:
+                self.feature_importance = {}
+            
             return True
 
         except MLModel.DoesNotExist:
@@ -252,6 +476,118 @@ class NFLTouchdownModel:
         except Exception as e:
             print(f"[Error] Failed to load model: {str(e)}")
             return False
+    
+    def _calculate_feature_importance(self, X_encoded, feature_names):
+        """Calculate feature importance using multiple methods"""
+        try:
+            # Get feature names - need to handle encoded features
+            if hasattr(self.encoder, 'get_feature_names_out'):
+                encoded_feature_names = self.encoder.get_feature_names_out(feature_names)
+            else:
+                # Fallback: use indices
+                encoded_feature_names = [f"feature_{i}" for i in range(X_encoded.shape[1])]
+            
+            self.feature_names = list(encoded_feature_names)
+            
+            # 1. XGBoost built-in feature importance (gain)
+            importance_gain = self.model.get_score(importance_type='gain')
+            importance_weight = self.model.get_score(importance_type='weight')
+            importance_cover = self.model.get_score(importance_type='cover')
+            
+            # Convert to feature names (XGBoost uses f0, f1, f2...)
+            feature_importance_dict = {}
+            for i, feat_name in enumerate(encoded_feature_names):
+                xgb_key = f"f{i}"
+                feature_importance_dict[feat_name] = {
+                    'gain': importance_gain.get(xgb_key, 0),
+                    'weight': importance_weight.get(xgb_key, 0),
+                    'cover': importance_cover.get(xgb_key, 0),
+                }
+            
+            self.feature_importance = feature_importance_dict
+            
+            # 2. SHAP values (if available) - more accurate for feature importance
+            if SHAP_AVAILABLE:
+                print("[Feature Importance] Calculating SHAP values for feature importance...")
+                try:
+                    # Use a sample of data for SHAP (too expensive on full dataset)
+                    sample_size = min(1000, len(X_encoded))
+                    sample_indices = np.random.choice(len(X_encoded), sample_size, replace=False)
+                    X_sample = X_encoded[sample_indices]
+                    
+                    explainer = shap.TreeExplainer(self.model)
+                    shap_values = explainer.shap_values(X_sample)
+                    
+                    # Calculate mean absolute SHAP values per feature
+                    if isinstance(shap_values, list):
+                        shap_values = shap_values[0]  # For binary classification, get first class
+                    
+                    mean_shap = np.abs(shap_values).mean(axis=0)
+                    
+                    # Add SHAP importance to feature importance dict
+                    for i, feat_name in enumerate(encoded_feature_names):
+                        if feat_name in self.feature_importance:
+                            self.feature_importance[feat_name]['shap'] = float(mean_shap[i])
+                        else:
+                            self.feature_importance[feat_name] = {'shap': float(mean_shap[i])}
+                    
+                    print("[Feature Importance] SHAP values calculated successfully")
+                except Exception as e:
+                    print(f"[Warning] Could not calculate SHAP values: {e}")
+            
+            print(f"[Feature Importance] Calculated importance for {len(self.feature_importance)} features")
+            
+        except Exception as e:
+            print(f"[Warning] Error calculating feature importance: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def _export_feature_importance(self):
+        """Export feature importance to CSV for analysis"""
+        try:
+            import os
+            from django.conf import settings
+            
+            if not self.feature_importance:
+                print("[Warning] No feature importance data to export")
+                return
+            
+            # Prepare data for export
+            importance_data = []
+            for feat_name, importance in self.feature_importance.items():
+                row = {'feature': feat_name}
+                row.update(importance)
+                importance_data.append(row)
+            
+            df_importance = pd.DataFrame(importance_data)
+            
+            # Sort by SHAP importance if available, otherwise by gain
+            if 'shap' in df_importance.columns:
+                df_importance = df_importance.sort_values('shap', ascending=False)
+            elif 'gain' in df_importance.columns:
+                df_importance = df_importance.sort_values('gain', ascending=False)
+            
+            # Export to CSV
+            base_dir = settings.BASE_DIR if hasattr(settings, 'BASE_DIR') else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            csv_path = os.path.join(base_dir, f'feature_importance_s{self.season}_w{self.week}.csv')
+            df_importance.to_csv(csv_path, index=False)
+            
+            print(f"[Feature Importance] Exported to {csv_path}")
+            
+            # Print top 20 features
+            print("\n[Feature Importance] Top 20 Most Important Features:")
+            print("=" * 80)
+            top_col = 'shap' if 'shap' in df_importance.columns else 'gain'
+            top_features = df_importance.head(20)
+            for idx, row in top_features.iterrows():
+                feat_name = row['feature']
+                importance_val = row[top_col]
+                print(f"  {feat_name:50s} {importance_val:10.4f}")
+            
+        except Exception as e:
+            print(f"[Warning] Error exporting feature importance: {e}")
+            import traceback
+            traceback.print_exc()
 
     def predict(
         self, current_week: pd.DataFrame, features: list, numeric_features: list, 
@@ -278,14 +614,113 @@ class NFLTouchdownModel:
             )
 
         try:
+            # Validate required columns
+            if "player_id" not in current_week.columns:
+                raise ValueError("Missing required column: player_id")
+            
+            # Filter features to only those that exist in the dataframe
+            available_features = [f for f in features if f in current_week.columns]
+            missing_features = [f for f in features if f not in current_week.columns]
+            
+            if missing_features:
+                print(f"[Warning] Missing features in prediction dataframe: {missing_features}")
+                print(f"[Info] Using {len(available_features)} available features out of {len(features)} requested")
+            
+            if not available_features:
+                raise ValueError(
+                    f"No features available. Missing all {len(features)} features. Available columns: {list(current_week.columns)[:20]}"
+                )
+            
             # Prepare data
-            X = current_week[["player_id"] + features].copy()
+            X = current_week[["player_id"] + available_features].copy()
             player_ids = X["player_id"].values
             X = X.drop("player_id", axis=1)
+            
+            # Track which features were NaN BEFORE preprocessing
+            # This is important for SHAP - we don't want to show contributions for features that don't apply
+            # Store as dict: {feature_name: Series of booleans indicating NaN per row}
+            original_nan_mask = {}
+            for col in X.columns:
+                # Check if column has NaN values (works for numeric and object types)
+                if X[col].isna().any():
+                    original_nan_mask[col] = X[col].isna()
+            
+            # Update numeric_features to only include those that exist
+            available_numeric_features = [f for f in numeric_features if f in X.columns]
+            
+            # Filter out categorical features from numeric processing
+            categorical_features = ["position", "report_status"]
+            numeric_only_features = [f for f in available_numeric_features if f not in categorical_features]
 
-            # Apply preprocessing
-            X[numeric_features] = self.imputer.transform(X[numeric_features])
-            X[numeric_features] = self.scaler.transform(X[numeric_features])
+            # Apply preprocessing with position-aware handling (same as training)
+            if numeric_only_features:
+                # Use position-aware imputation similar to training
+                X_imputed = X[numeric_only_features].copy()
+                
+                # Get position column if available
+                position_col = None
+                if "position" in X.columns:
+                    position_col = X["position"]
+                
+                # Apply same position-aware imputation logic as training
+                wr_te_features = [
+                    "end_zone_targets_ewma",
+                ]
+                rb_only_features = []
+                rb_qb_features = ["carries_ewma"]
+                qb_only_features = [
+                    "designed_rush_attempts_ewma",
+                    "qb_rolling_rushing_yards_ewma", "qb_rolling_rushing_TDs_ewma"
+                ]
+                
+                for feature in numeric_only_features:
+                    if feature in X_imputed.columns:
+                        applicable_positions = None
+                        if feature in wr_te_features:
+                            applicable_positions = ["WR", "TE"]  # WR/TE only
+                        elif feature in rb_only_features:
+                            applicable_positions = ["RB"]  # RB only
+                        elif feature in rb_qb_features:
+                            applicable_positions = ["RB", "QB"]  # RB/QB only
+                        elif feature in qb_only_features:
+                            applicable_positions = ["QB"]  # QB only
+                        
+                        if applicable_positions and position_col is not None:
+                            # Only impute for applicable positions
+                            mask = position_col.isin(applicable_positions)
+                            if mask.any() and feature in self.scaler_means:
+                                # Use training mean for imputation
+                                mean_val = self.scaler_means[feature]
+                                if pd.notna(mean_val):
+                                    X_imputed.loc[mask & X_imputed[feature].isna(), feature] = mean_val
+                                else:
+                                    X_imputed.loc[mask & X_imputed[feature].isna(), feature] = 0
+                            # For non-applicable positions, keep NaN
+                        else:
+                            # General feature - use training mean
+                            if feature in self.scaler_means:
+                                mean_val = self.scaler_means[feature]
+                                if pd.notna(mean_val):
+                                    X_imputed[feature] = X_imputed[feature].fillna(mean_val)
+                                else:
+                                    X_imputed[feature] = X_imputed[feature].fillna(0)
+                
+                X[numeric_only_features] = X_imputed
+                
+                # Apply scaling using stored parameters (preserves NaN)
+                for feature in numeric_only_features:
+                    if feature in X.columns and feature in self.scaler_means and feature in self.scaler_stds:
+                        mean_val = self.scaler_means[feature]
+                        std_val = self.scaler_stds[feature]
+                        if pd.notna(std_val) and std_val > 0:
+                            # Scale non-NaN values, preserve NaN
+                            mask = X[feature].notna()
+                            X.loc[mask, feature] = (X.loc[mask, feature] - mean_val) / std_val
+                        elif pd.notna(mean_val):
+                            # If std is 0 or NaN, just center it
+                            mask = X[feature].notna()
+                            X.loc[mask, feature] = X.loc[mask, feature] - mean_val
+            
             X_encoded = self.encoder.transform(X)
 
             # Predict
@@ -305,11 +740,21 @@ class NFLTouchdownModel:
                     
                     # Convert to dict for easier JSON serialization
                     # shap_values_array shape: (n_samples, n_features)
+                    # Note: Use available_features since that's what was actually used for prediction
                     shap_values = {}
                     for i, player_id in enumerate(player_ids):
                         feature_contributions = {}
-                        for j, feature in enumerate(features):
-                            feature_contributions[feature] = float(shap_values_array[i][j])
+                        for j, feature in enumerate(available_features):
+                            # Get SHAP contribution
+                            shap_contrib = float(shap_values_array[i][j])
+                            
+                            # CRITICAL: If the feature was NaN in the original data (doesn't apply),
+                            # set SHAP contribution to 0 to avoid misleading explanations
+                            # This prevents showing "air_yards_share_ewma +50%" when the value was actually NaN
+                            if feature in original_nan_mask and original_nan_mask[feature].iloc[i]:
+                                shap_contrib = 0.0
+                            
+                            feature_contributions[feature] = shap_contrib
                         shap_values[str(player_id)] = {
                             'contributions': feature_contributions,
                             'base_value': float(shap_base_value)

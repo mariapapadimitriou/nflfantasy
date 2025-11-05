@@ -21,90 +21,86 @@ except (ImportError, AttributeError, RuntimeError):
 # Note: Models and historical data are now stored in SQLite database
 # All data is computed on-the-fly, no file caching needed
 
-# Feature Configuration
+# Feature Configuration - Complete Feature Overhaul
 FEATURES = [
-    "home",
-    "prev_receiving_touchdowns",
-    "prev_receiving_yards",
-    "prev_rushing_touchdowns",
-    "prev_rushing_yards",
-    "prev_receptions",
-    "prev_targets",
-    "report_status",
-    "rolling_receiving_touchdowns",
-    "rolling_receiving_yards",
-    "rolling_rushing_touchdowns",
-    "rolling_rushing_yards",
-    "rolling_receptions",
-    "rolling_targets",
-    "touchdown_attempts",
-    "rolling_touchdown_attempts",
-    "red_zone_completion_pct",
-    "rolling_red_zone_completion_pct",
-    "rookie",
-    "wp",
-    "rolling_red_zone",
-    "rolling_yapg",
-    "prev_red_zone",
-    "prev_red_zone_completion_pct",
-    "qb_rolling_passing_tds",
-    "qb_rolling_passing_yards",
-    # Defensive stats (rolling)
-    "rolling_def_yards_gained",
-    "rolling_def_touchdown",
-    "rolling_def_passing_yards",
-    "rolling_def_rushing_yards",
-    "rolling_def_points_allowed",
-    # Defensive stats (previous season)
-    "prev_def_yards_gained",
-    "prev_def_touchdown",
-    "prev_def_passing_yards",
-    "prev_def_rushing_yards",
-    "prev_def_points_allowed",
+    # Player Usage & Performance Metrics (EWMA)
+    "targets_ewma", # player_stats
+    "receptions_ewma", # player_stats
+    "carries_ewma", # player_stats
+    "touches_ewma", # player_stats
+    "receiving_yards_ewma", # player_stats
+    "receiving_touchdowns_ewma", # player_stats
+    "rushing_yards_ewma", # player_stats
+    "rushing_touchdowns_ewma", # player_stats
+    "red_zone_touches_ewma", 
+    "red_zone_touch_share_ewma",
+    "end_zone_targets_ewma",
+    "designed_rush_attempts_ewma",
+    
+    # Team Context (EWMA)
+    "team_play_volume_ewma",
+    "team_total_red_zone_touches_ewma",
+    "team_total_air_yards_ewma",
+    "team_win_probability",
+    "spread_line",
+    
+    # Defense Context (EWMA)
+    "def_ewma_yards_allowed_per_game",
+    "def_ewma_TDs_allowed_per_game",
+    "def_ewma_red_zone_completion_pct_allowed",
+    "def_ewma_interceptions_per_game",
+    "opponent_red_zone_def_rank",
+    
+    # QB Context (EWMA)
+    "qb_rolling_rushing_yards_ewma",
+    "qb_rolling_rushing_TDs_ewma",
+    
+    # Player Identity / Categorical Features
+    "position",
 ]
 
 NUMERIC_FEATURES = [
-    "prev_receiving_touchdowns",
-    "prev_receiving_yards",
-    "prev_rushing_touchdowns",
-    "prev_rushing_yards",
-    "prev_receptions",
-    "prev_targets",
-    "rolling_receiving_touchdowns",
-    "rolling_receiving_yards",
-    "rolling_rushing_touchdowns",
-    "rolling_rushing_yards",
-    "rolling_receptions",
-    "rolling_targets",
-    "touchdown_attempts",
-    "rolling_touchdown_attempts",
-    "red_zone_completion_pct",
-    "rolling_red_zone_completion_pct",
-    "wp",
-    "rolling_red_zone",
-    "rolling_yapg",
-    "prev_red_zone",
-    "prev_red_zone_completion_pct",
-    "qb_rolling_passing_tds",
-    "qb_rolling_passing_yards",
-    # Defensive stats (rolling)
-    "rolling_def_yards_gained",
-    "rolling_def_touchdown",
-    "rolling_def_passing_yards",
-    "rolling_def_rushing_yards",
-    "rolling_def_points_allowed",
-    # Defensive stats (previous season)
-    "prev_def_yards_gained",
-    "prev_def_touchdown",
-    "prev_def_passing_yards",
-    "prev_def_rushing_yards",
-    "prev_def_points_allowed",
+    # Player Usage & Performance Metrics (EWMA)
+    "targets_ewma",
+    "receptions_ewma",
+    "carries_ewma",
+    "touches_ewma",
+    "receiving_yards_ewma",
+    "receiving_touchdowns_ewma",
+    "rushing_yards_ewma",
+    "rushing_touchdowns_ewma",
+    "red_zone_touches_ewma",
+    "red_zone_touch_share_ewma",
+    "end_zone_targets_ewma",
+    "designed_rush_attempts_ewma",
+    
+    # Team Context (EWMA)
+    "team_play_volume_ewma",
+    "team_total_red_zone_touches_ewma",
+    "team_total_air_yards_ewma",
+    "team_win_probability",
+    "spread_line",
+    
+    # Defense Context (EWMA)
+    "def_ewma_yards_allowed_per_game",
+    "def_ewma_TDs_allowed_per_game",
+    "def_ewma_red_zone_completion_pct_allowed",
+    "def_ewma_interceptions_per_game",
+    "opponent_red_zone_def_rank",
+    
+    # QB Context (EWMA)
+    "qb_rolling_rushing_yards_ewma",
+    "qb_rolling_rushing_TDs_ewma",
+]
+
+CATEGORICAL_FEATURES = [
+    "position",
 ]
 
 # Player positions to include
 POSITIONS = ["WR", "QB", "RB", "TE"]
 
-# Report status categories
+# Report status categories (kept for reference, may not be used in new features)
 REPORT_STATUS_ORDER = ["Healthy", "Minor", "Questionable", "Doubtful", "Out"]
 
 # Model Configuration
@@ -119,6 +115,11 @@ MODEL_PARAMS = {
     "prediction_threshold": 0.5,
 }
 
+# Feature Engineering Configuration
+EWMA_ALPHA = 0.7  # Exponential decay factor (0-1, higher = more weight to recent games)
+EWMA_WEEKS = 4  # Number of previous weeks to consider for EWMA
+REGRESSION_LAMBDA = 0.3  # Lambda for regression_td_factor: EWMA + λ(xTD - EWMA)
+
 # Data Loading Configuration
 HISTORICAL_SEASONS = 3  # Number of previous seasons to load
 MAX_WEEK = 20
@@ -126,4 +127,3 @@ MAX_WEEK = 20
 # Cache Configuration
 CACHE_ENABLED = True
 # Historical data is now stored in SQLite database via TrainingData model
-
