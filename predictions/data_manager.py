@@ -24,7 +24,7 @@ from .config import (
     REPORT_STATUS_ORDER,
 )
 from .data_source import get_data_source
-from .utils import american_odds_to_probability, compute_red_zone_stats
+from .utils import american_odds_to_probability
 from .models import TrainingData, DataCache
 
 
@@ -34,8 +34,6 @@ class NFLDataManager:
     def __init__(self, data_source_type: str = "nflreadpy"):
         self.data_source = get_data_source(data_source_type)
         self.historical_data = None
-        self.rz_stats_rolling = None
-        self.rz_stats_prev = None
 
     def load_historical_data(self, season: int = None, week: int = None) -> pd.DataFrame:
         """Load cached historical data from database"""
@@ -128,10 +126,11 @@ class NFLDataManager:
             traceback.print_exc()
 
     def get_seasons_to_load(self, season: int, week: int) -> list:
-        """Determine which seasons need to be loaded"""
-        if week == 1:
-            # For week 1, don't include current season in historical
-            return list(range(season - HISTORICAL_SEASONS - 1, season))
+        """Determine which seasons need to be loaded
+        For training: only load season - 2 (so for 2025: 2023, 2024, 2025)
+        """
+        # Always include current season (for future weeks) and last 2 seasons
+        # For 2025: load [2023, 2024, 2025]
         return list(range(season - HISTORICAL_SEASONS, season + 1))
 
     def load_and_process_data(
@@ -219,9 +218,6 @@ class NFLDataManager:
                     f"No schedule data found for Season {season}, Week {week}. Week may not have occurred yet or data not available."
                 )
 
-            # Compute red zone stats from play-by-play data
-            print(f"[Debug] Computing red zone stats from play-by-play data...")
-            self.rz_stats_rolling, self.rz_stats_prev = compute_red_zone_stats(pbp)
 
             # Process current week
             print(f"[Debug] Processing current week data...")
@@ -257,9 +253,6 @@ class NFLDataManager:
 
         # print(injuries.head())
 
-        # Compute red zone stats from play-by-play data
-        print("[Processing] Computing red zone statistics from play-by-play data...")
-        self.rz_stats_rolling, self.rz_stats_prev = compute_red_zone_stats(pbp)
 
         # Filter schedules
         schedules = schedules[
@@ -303,11 +296,12 @@ class NFLDataManager:
             f"[Processing] Historical after 'played' filter: {len(historical)} records"
         )
 
-        # Keep enough historical data (at least 3 seasons)
-        min_season = season - HISTORICAL_SEASONS
+        # Keep only last 2 seasons (season - 2) plus completed weeks of current season
+        # For 2025: use 2023, 2024, and weeks in 2025 that have already happened
+        min_season = season - HISTORICAL_SEASONS  # season - 2
         historical = historical[historical["season"] >= min_season].copy()
         print(
-            f"[Processing] Historical after season filter (>={min_season}): {len(historical)} records"
+            f"[Processing] Historical after season filter (>={min_season}, last {HISTORICAL_SEASONS} seasons): {len(historical)} records"
         )
 
         # Save the full processed data for future use
@@ -346,16 +340,16 @@ class NFLDataManager:
 
         # Build weekly stats from player_stats (base stats for feature engineering)
         weekly_stats_cols = [
-            "player_id",
-            "season",
-            "week",
-            "rushing_yards",
-            "rushing_tds",
-            "receiving_yards",
-            "receiving_tds",
-            "passing_tds",
-            "passing_yards",
-        ]
+                "player_id",
+                "season",
+                "week",
+                "rushing_yards",
+                "rushing_tds",
+                "receiving_yards",
+                "receiving_tds",
+                "passing_tds",
+                "passing_yards",
+            ]
         # Add receptions and targets if they exist
         if "receptions" in player_stats.columns:
             weekly_stats_cols.append("receptions")
@@ -365,7 +359,64 @@ class NFLDataManager:
             weekly_stats_cols.append("carries")
             
         weekly_stats = player_stats[weekly_stats_cols].copy()
-        print(f"[Debug] weekly_stats: {len(weekly_stats)} records")
+        print(f"[Debug] weekly_stats from player_stats: {len(weekly_stats)} records")
+        
+        # For future weeks, create placeholder rows so EWMA features can be calculated
+        # Get all players from schedule (for current week) and roster
+        if len(schedules) > 0:
+            current_week_schedule = schedules[(schedules["season"] == season) & (schedules["week"] == week)]
+            if len(current_week_schedule) > 0:
+                # Get all players from roster who are active
+                active_players = roster[roster["status"] == "ACT"][
+                    ["gsis_id", "season", "team"]
+                ].drop_duplicates()
+                active_players = active_players.rename(columns={"gsis_id": "player_id"})
+                
+                # Create placeholder rows for current week players
+                current_week_players = []
+                for _, game in current_week_schedule.iterrows():
+                    # Add home team players
+                    home_players = active_players[
+                        (active_players["season"] == season) & 
+                        (active_players["team"] == game["home_team"])
+                    ][["player_id"]].copy()
+                    home_players["season"] = season
+                    home_players["week"] = week
+                    
+                    # Add away team players
+                    away_players = active_players[
+                        (active_players["season"] == season) & 
+                        (active_players["team"] == game["away_team"])
+                    ][["player_id"]].copy()
+                    away_players["season"] = season
+                    away_players["week"] = week
+                    
+                    current_week_players.append(home_players)
+                    current_week_players.append(away_players)
+                
+                if len(current_week_players) > 0:
+                    current_week_df = pd.concat(current_week_players, ignore_index=True).drop_duplicates()
+                    
+                    # Check which players don't have weekly_stats for current week
+                    existing_stats = weekly_stats[
+                        (weekly_stats["season"] == season) & (weekly_stats["week"] == week)
+                    ][["player_id"]].drop_duplicates()
+                    
+                    missing_players = current_week_df[
+                        ~current_week_df["player_id"].isin(existing_stats["player_id"])
+                    ]
+                    
+                    if len(missing_players) > 0:
+                        # Create placeholder rows with NaN/0 for all stat columns
+                        placeholder_stats = missing_players.copy()
+                        stat_cols = [col for col in weekly_stats_cols if col not in ["player_id", "season", "week"]]
+                        for col in stat_cols:
+                            placeholder_stats[col] = 0  # Use 0 for counts, will be handled properly in EWMA
+                        
+                        # Concatenate with existing weekly_stats
+                        weekly_stats = pd.concat([weekly_stats, placeholder_stats], ignore_index=True)
+                        print(f"[Debug] Added {len(missing_players)} placeholder rows for current week players without stats")
+                        print(f"[Debug] weekly_stats after adding placeholders: {len(weekly_stats)} records")
         
         # Ensure pbp has game_id, season, week for merging
         if "game_id" not in pbp.columns and "gameId" in pbp.columns:
@@ -487,6 +538,10 @@ class NFLDataManager:
         print(f"[Debug] df after initial build: {len(df)} records")
 
         # Merge touchdowns
+        # Target variable: Binary (1 if player scored ANY touchdown, 0 otherwise)
+        # - For TE/WR/RB: Includes both rushing AND receiving touchdowns
+        # - For QB: Only rushing touchdowns (QBs don't catch passes)
+        # td_player_id in play-by-play data captures the scorer regardless of play type
         touchdowns = pbp[pbp["touchdown"] == 1][
             ["td_player_id", "game_id"]
         ].drop_duplicates()
@@ -500,6 +555,7 @@ class NFLDataManager:
             right_on=["td_player_id", "game_id"],
             indicator=True,
         )
+        # Binary target: 1 = scored any TD (rushing or receiving), 0 = no TD
         mdf["touchdown"] = mdf["_merge"].apply(lambda x: 1 if x == "both" else 0)
         df = mdf.drop(["_merge", "td_player_id"], axis=1)
         print(f"[Debug] df after touchdown merge: {len(df)} records")
@@ -623,6 +679,9 @@ class NFLDataManager:
         )
         df["is_home"] = np.where(df["team"] == df["home_team"], 1, 0)
         
+        # Note: defense categorical feature removed - high cardinality causes overfitting
+        # Defense quality is captured by defensive EWMA features instead
+        
         # Merge weekly stats for feature engineering
         df = pd.merge(df, weekly_stats, on=["player_id", "season", "week"], how="left")
         print(f"[Debug] df after weekly_stats merge: {len(df)} records")
@@ -652,8 +711,7 @@ class NFLDataManager:
         )
         print(f"[Debug] Added team and position columns to player_features_df")
         
-        # Note: end_zone_targets_ewma has been removed from features
-        # Red zone touches now covers both targets and carries for all positions
+        # Red zone touches covers both targets and carries for all positions
         
         # Set position-inapplicable stats to NaN (not 0) to indicate feature doesn't apply
         # This allows the model to distinguish between "0 = no activity" vs "NaN = feature doesn't apply"
@@ -696,8 +754,8 @@ class NFLDataManager:
         # df has qb_id column that identifies which QB played for each player's team
         if len(qb_stats_df) > 0 and "qb_id" in df.columns:
             # Drop existing QB stat columns from player_features_df if they exist
-            qb_stat_cols = ["qb_passing_yards_ewma", "qb_passing_TDs_ewma",
-                           "qb_rushing_yards_ewma", "qb_rushing_TDs_ewma"]
+            # Only keep yardage stats, not TD counts (to avoid spurious correlations)
+            qb_stat_cols = ["qb_passing_yards_ewma", "qb_rushing_yards_ewma"]
             for col in qb_stat_cols:
                 if col in player_features_df.columns:
                     player_features_df = player_features_df.drop(columns=[col])
@@ -731,6 +789,9 @@ class NFLDataManager:
                     if col in player_features_df.columns:
                         player_features_df.loc[qb_mask, col] = np.nan
                 print(f"[Debug] Set QB stats to NaN for {qb_mask.sum()} QB players (they use personal stats)")
+            
+            # Note: QB TD stats removed to avoid spurious correlations
+            # Only QB yardage stats are kept (qb_passing_yards_ewma, qb_rushing_yards_ewma)
             
             print(f"[Debug] Merged QB stats onto all players by qb_id, season, week")
         else:
@@ -818,6 +879,159 @@ class NFLDataManager:
         df = df.drop(["team_def"], axis=1, errors="ignore")
         print(f"[Debug] df after defensive features merge: {len(df)} records")
         
+        # Calculate position-normalized touches_ewma to remove RB/QB bias
+        # Normalize touches_ewma by position average (WRs/TEs naturally have lower touches than RBs)
+        if "touches_ewma" in df.columns and "position" in df.columns:
+            print(f"[Debug] Calculating position-normalized touches_ewma...")
+            # Calculate position average touches_ewma (grouped by position, season, week)
+            # This gives us the average touches for each position in each week
+            position_avg_touches = df.groupby(["position", "season", "week"])["touches_ewma"].mean().reset_index()
+            position_avg_touches = position_avg_touches.rename(columns={"touches_ewma": "position_avg_touches_ewma"})
+            
+            # Merge position averages back
+            df = pd.merge(
+                df,
+                position_avg_touches,
+                on=["position", "season", "week"],
+                how="left"
+            )
+            
+            # Calculate normalized touches: player_touches / position_avg_touches
+            # This makes a WR with 5 touches (high for a WR) comparable to an RB with 15 touches (high for an RB)
+            df["touches_ewma_position_normalized"] = (
+                df["touches_ewma"] / (df["position_avg_touches_ewma"] + 1e-6)  # Add small epsilon to avoid division by zero
+            )
+            
+            # Set to NaN if touches_ewma was NaN (preserve missing values)
+            df.loc[df["touches_ewma"].isna(), "touches_ewma_position_normalized"] = np.nan
+            
+            # Drop the intermediate position_avg_touches_ewma column
+            df = df.drop(columns=["position_avg_touches_ewma"])
+            
+            # Debug: Show sample of normalized values
+            if len(df) > 0:
+                sample_normalized = df[df["touches_ewma_position_normalized"].notna()].groupby("position")["touches_ewma_position_normalized"].describe()
+                print(f"[Debug] Position-normalized touches_ewma stats by position:")
+                print(sample_normalized)
+        
+        # Calculate position-normalized red_zone_touches_ewma to remove RB/QB bias
+        # Normalize red_zone_touches_ewma by position average (WRs/TEs naturally have fewer red zone touches than RBs)
+        if "red_zone_touches_ewma" in df.columns and "position" in df.columns:
+            print(f"[Debug] Calculating position-normalized red_zone_touches_ewma...")
+            # Calculate position average red_zone_touches_ewma (grouped by position, season, week)
+            position_avg_rz_touches = df.groupby(["position", "season", "week"])["red_zone_touches_ewma"].mean().reset_index()
+            position_avg_rz_touches = position_avg_rz_touches.rename(columns={"red_zone_touches_ewma": "position_avg_red_zone_touches_ewma"})
+            
+            # Merge position averages back
+            df = pd.merge(
+                df,
+                position_avg_rz_touches,
+                on=["position", "season", "week"],
+                how="left"
+            )
+            
+            # Calculate normalized red zone touches: player_rz_touches / position_avg_rz_touches
+            df["red_zone_touches_ewma_position_normalized"] = (
+                df["red_zone_touches_ewma"] / (df["position_avg_red_zone_touches_ewma"] + 1e-6)
+            )
+            
+            # Set to NaN if red_zone_touches_ewma was NaN (preserve missing values)
+            df.loc[df["red_zone_touches_ewma"].isna(), "red_zone_touches_ewma_position_normalized"] = np.nan
+            
+            # Drop the intermediate position_avg_red_zone_touches_ewma column
+            df = df.drop(columns=["position_avg_red_zone_touches_ewma"])
+            
+            # Debug: Show sample of normalized values
+            if len(df) > 0:
+                sample_rz_normalized = df[df["red_zone_touches_ewma_position_normalized"].notna()].groupby("position")["red_zone_touches_ewma_position_normalized"].describe()
+                print(f"[Debug] Position-normalized red_zone_touches_ewma stats by position:")
+                print(sample_rz_normalized)
+        
+        # Calculate reception_rate_ewma (receptions / targets)
+        # This is more meaningful than separate receptions/targets features:
+        # - High rate = reliable hands (good for TD scoring)
+        # - Low rate = drops/poor hands (bad for TD scoring)
+        # - Works for all positions (WR/TE/RB who catch passes)
+        if "receptions_ewma" in df.columns and "targets_ewma" in df.columns:
+            print(f"[Debug] Calculating reception_rate_ewma...")
+            # Calculate rate: receptions / targets
+            # Use small epsilon to avoid division by zero
+            df["reception_rate_ewma"] = (
+                df["receptions_ewma"] / (df["targets_ewma"] + 1e-6)
+            )
+            
+            # Set to NaN if either component is NaN (preserve missing values)
+            df.loc[df["receptions_ewma"].isna() | df["targets_ewma"].isna(), "reception_rate_ewma"] = np.nan
+            
+            # Cap at 1.0 (can't have more receptions than targets)
+            df.loc[df["reception_rate_ewma"] > 1.0, "reception_rate_ewma"] = 1.0
+            
+            # Debug: Show sample of reception rates by position
+            if len(df) > 0:
+                sample_reception_rate = df[df["reception_rate_ewma"].notna()].groupby("position")["reception_rate_ewma"].describe()
+                print(f"[Debug] Reception rate (receptions/targets) stats by position:")
+                print(sample_reception_rate)
+        
+        # Calculate combined total_yards_ewma and total_touchdowns_ewma (position-agnostic)
+        # This combines rushing + receiving into unified metrics that work for all positions
+        # WRs get most from receiving, RBs from rushing, but both contribute to total production
+        print(f"[Debug] Calculating combined total yards and touchdowns...")
+        
+        # Total yards = receiving + rushing (works for all positions)
+        if "receiving_yards_ewma" in df.columns and "rushing_yards_ewma" in df.columns:
+            # Sum receiving and rushing yards, handling NaN properly
+            df["total_yards_ewma"] = (
+                df["receiving_yards_ewma"].fillna(0) + df["rushing_yards_ewma"].fillna(0)
+            )
+            # Set to NaN if both were originally NaN (not just 0)
+            both_nan = df["receiving_yards_ewma"].isna() & df["rushing_yards_ewma"].isna()
+            df.loc[both_nan, "total_yards_ewma"] = np.nan
+            # If one is NaN and other is 0, set to NaN (no production)
+            one_nan_zero = (
+                (df["receiving_yards_ewma"].isna() & (df["rushing_yards_ewma"].fillna(0) == 0)) |
+                (df["rushing_yards_ewma"].isna() & (df["receiving_yards_ewma"].fillna(0) == 0))
+            )
+            df.loc[one_nan_zero, "total_yards_ewma"] = np.nan
+        elif "receiving_yards_ewma" in df.columns:
+            df["total_yards_ewma"] = df["receiving_yards_ewma"]
+        elif "rushing_yards_ewma" in df.columns:
+            df["total_yards_ewma"] = df["rushing_yards_ewma"]
+        else:
+            df["total_yards_ewma"] = np.nan
+        
+        # Total touchdowns = receiving + rushing (works for all positions)
+        if "receiving_touchdowns_ewma" in df.columns and "rushing_touchdowns_ewma" in df.columns:
+            # Sum receiving and rushing TDs, handling NaN properly
+            df["total_touchdowns_ewma"] = (
+                df["receiving_touchdowns_ewma"].fillna(0) + df["rushing_touchdowns_ewma"].fillna(0)
+            )
+            # Set to NaN if both were originally NaN
+            both_nan = df["receiving_touchdowns_ewma"].isna() & df["rushing_touchdowns_ewma"].isna()
+            df.loc[both_nan, "total_touchdowns_ewma"] = np.nan
+            # If one is NaN and other is 0, set to NaN (no production)
+            one_nan_zero = (
+                (df["receiving_touchdowns_ewma"].isna() & (df["rushing_touchdowns_ewma"].fillna(0) == 0)) |
+                (df["rushing_touchdowns_ewma"].isna() & (df["receiving_touchdowns_ewma"].fillna(0) == 0))
+            )
+            df.loc[one_nan_zero, "total_touchdowns_ewma"] = np.nan
+        elif "receiving_touchdowns_ewma" in df.columns:
+            df["total_touchdowns_ewma"] = df["receiving_touchdowns_ewma"]
+        elif "rushing_touchdowns_ewma" in df.columns:
+            df["total_touchdowns_ewma"] = df["rushing_touchdowns_ewma"]
+        else:
+            df["total_touchdowns_ewma"] = np.nan
+        
+        # Debug: Show sample of combined totals by position
+        if len(df) > 0:
+            if "total_yards_ewma" in df.columns:
+                sample_total_yds = df[df["total_yards_ewma"].notna()].groupby("position")["total_yards_ewma"].describe()
+                print(f"[Debug] Total yards (receiving + rushing) stats by position:")
+                print(sample_total_yds)
+            if "total_touchdowns_ewma" in df.columns:
+                sample_total_tds = df[df["total_touchdowns_ewma"].notna()].groupby("position")["total_touchdowns_ewma"].describe()
+                print(f"[Debug] Total touchdowns (receiving + rushing) stats by position:")
+                print(sample_total_tds)
+        
         # Rename 'home' to 'is_home' for consistency with feature blueprint
         if "home" in df.columns:
             df["is_home"] = df["home"]
@@ -828,15 +1042,15 @@ class NFLDataManager:
         
         # Clean up duplicate columns from merges
         df = df.loc[:, ~df.columns.duplicated()]
-        
+
         # Clean data
         df = df.drop_duplicates()
         print(f"[Debug] df after drop_duplicates: {len(df)} records")
 
         # Filter out players with fewer than EWMA_WEEKS total records (minimum history requirement)
         # This ensures EWMA features have meaningful values
-        # NOTE: This counts ALL records across ALL historical seasons (including 2022 if HISTORICAL_SEASONS=3)
-        # So a player who played 5 games in 2022 and nothing else will be included in training
+        # NOTE: This counts ALL records across ALL historical seasons (season - 2, so for 2025: 2023, 2024, 2025 completed weeks)
+        # So a player who played 5 games in 2023 and nothing else will be included if they have >= EWMA_WEEKS total games
         # This filter applies to both training data and ensures only players with sufficient history are used
         from .config import EWMA_WEEKS
         if "player_id" in df.columns:
@@ -848,13 +1062,14 @@ class NFLDataManager:
             if before_count > after_count:
                 print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} total records from training data")
                 print(f"[Filter] Remaining players: {len(players_with_enough_history)} ({after_count} records)")
-                print(f"[Filter] This includes players from all historical seasons (2022+) as long as they have >= {EWMA_WEEKS} total games")
+                min_season_used = season - HISTORICAL_SEASONS
+                print(f"[Filter] This includes players from seasons {min_season_used}+ (season - {HISTORICAL_SEASONS}) as long as they have >= {EWMA_WEEKS} total games")
 
         # Filter out players marked as "Out" (if report_status exists)
         if "report_status" in df.columns:
             df.loc[~df["report_status"].isin(REPORT_STATUS_ORDER), "report_status"] = "Minor"
-            df = df[~(df.report_status == "Out")]
-            print(f"[Debug] df after removing 'Out' status: {len(df)} records")
+        df = df[~(df.report_status == "Out")]
+        print(f"[Debug] df after removing 'Out' status: {len(df)} records")
 
         # Add played indicator (1 if player had stats, 0 otherwise)
         print(f"[Debug] Adding played indicator...")
@@ -864,7 +1079,7 @@ class NFLDataManager:
         df["played"] = df["played"].fillna(0).astype(int)
         print(f"[Debug] df after played merge: {len(df)} records")
         print(f"[Debug] Played distribution: {df['played'].value_counts().to_dict()}")
-        
+
         # Ensure all required features from config are present (fill missing with NaN, not 0)
         from .config import FEATURES
         for feature in FEATURES:

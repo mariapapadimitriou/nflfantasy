@@ -253,6 +253,7 @@ def predict_week_view(request):
         
         # Get current week data from session (NaN values will be preserved)
         current_week = pd.read_json(request.session['current_week_data'], orient='split')
+        print(f"[Debug] Initial current_week size: {len(current_week)} players")
         
         # Filter players with fewer than EWMA_WEEKS records (minimum history requirement)
         # NOTE: This counts total records across ALL historical seasons (including 2022) + current week
@@ -285,13 +286,77 @@ def predict_week_view(request):
                 print(f"[Warning] No players have >= {EWMA_WEEKS} records. This is expected for early weeks.")
         
         # Filter out players who haven't played (no stats) - they shouldn't be predicted
-        # Only filter if 'played' column exists
+        # NOTE: For future weeks (games haven't happened yet), skip this filter since played=0 for everyone
+        # Instead, rely on EWMA features filter which uses historical data
         if 'played' in current_week.columns:
-            before_count = len(current_week)
-            current_week = current_week[current_week['played'] == 1].copy()
-            after_count = len(current_week)
-            if before_count > after_count:
-                print(f"[Filter] Removed {before_count - after_count} players with no stats (played=0) from predictions")
+            # Check if this is a future week (all players have played=0)
+            all_not_played = (current_week['played'] == 0).all() if len(current_week) > 0 else False
+            if not all_not_played:
+                # This is a past week - filter out players who didn't play
+                before_count = len(current_week)
+                current_week = current_week[current_week['played'] == 1].copy()
+                after_count = len(current_week)
+                if before_count > after_count:
+                    print(f"[Filter] Removed {before_count - after_count} players with no stats (played=0) from predictions")
+            else:
+                # This is a future week - skip played filter, rely on EWMA features instead
+                print(f"[Filter] Future week detected (all players have played=0). Skipping played filter, using EWMA features instead.")
+        
+        # Apply minimum usage filter to improve precision (filter out inactive players)
+        # Position-aware: QBs use different criteria than skill position players
+        from .config import MODEL_PARAMS
+        if MODEL_PARAMS.get("min_usage_filter", True):
+            min_touches = MODEL_PARAMS.get("min_touches_ewma", 3.0)
+            # Use touches_ewma for filtering (still use raw touches for threshold, not normalized)
+            if "touches_ewma" in current_week.columns and "position" in current_week.columns:
+                before_count = len(current_week)
+                
+                # Separate filters for QBs vs other positions
+                is_qb = current_week["position"] == "QB"
+                is_skill_position = ~is_qb
+                
+                # For skill positions (WR/TE/RB): use touches_ewma or red_zone_touches_ewma
+                has_min_touches = current_week["touches_ewma"].notna() & (current_week["touches_ewma"] >= min_touches)
+                has_red_zone = False
+                if "red_zone_touches_ewma" in current_week.columns:
+                    has_red_zone = current_week["red_zone_touches_ewma"].notna() & (current_week["red_zone_touches_ewma"] > 0)
+                
+                # For QBs: must have rushing attempts (carries_ewma) since they score rushing TDs
+                # QBs with low rushing attempts shouldn't be predicted
+                qb_has_rushing = False
+                if "carries_ewma" in current_week.columns:
+                    # QBs need at least some rushing attempts to be legitimate TD threats
+                    qb_min_carries = 2.0  # Lower threshold for QBs (they don't rush as much)
+                    qb_has_rushing = current_week["carries_ewma"].notna() & (current_week["carries_ewma"] >= qb_min_carries)
+                qb_has_red_zone = False
+                if "red_zone_touches_ewma" in current_week.columns:
+                    # QBs can also pass if they have red zone rushing attempts
+                    qb_has_red_zone = current_week["red_zone_touches_ewma"].notna() & (current_week["red_zone_touches_ewma"] > 0)
+                
+                # Combine: skill positions use touches/red_zone, QBs use carries/red_zone
+                skill_position_mask = is_skill_position & (has_min_touches | has_red_zone)
+                qb_mask = is_qb & (qb_has_rushing | qb_has_red_zone)
+                keep_mask = skill_position_mask | qb_mask
+                
+                # Debug: Show how many players pass each condition
+                if before_count > 0:
+                    print(f"[Debug] Position-aware filter:")
+                    print(f"  - Skill positions: {has_min_touches.sum()} have touches_ewma >= {min_touches}, {has_red_zone.sum() if has_red_zone is not False else 0} have red_zone_touches")
+                    if "carries_ewma" in current_week.columns:
+                        print(f"  - QBs: {qb_has_rushing.sum() if qb_has_rushing is not False else 0} have carries_ewma >= 2.0, {qb_has_red_zone.sum() if qb_has_red_zone is not False else 0} have red_zone_touches")
+                    print(f"  - Combined: {keep_mask.sum()} players pass (out of {before_count})")
+                
+                current_week = current_week[keep_mask].copy()
+                after_count = len(current_week)
+                if before_count > after_count:
+                    removed_qbs = (is_qb & ~qb_mask).sum() if 'qb_mask' in locals() else 0
+                    removed_skill = (is_skill_position & ~skill_position_mask).sum() if 'skill_position_mask' in locals() else 0
+                    print(f"[Filter] Removed {before_count - after_count} players:")
+                    print(f"  - {removed_qbs} QBs (low carries_ewma or no red zone touches)")
+                    print(f"  - {removed_skill} skill positions (low touches_ewma or no red zone touches)")
+                elif len(current_week) == 0 and before_count > 0:
+                    print(f"[Warning] All {before_count} players filtered out by min_usage_filter!")
+                    print(f"[Warning] Consider adjusting thresholds or disabling min_usage_filter")
         
         # Additional filter: Remove players with no meaningful stats (all key features are NaN or 0)
         # Even if played=1, they might have no actual usage stats
@@ -363,9 +428,25 @@ def predict_week_view(request):
         
         # Check if we have any players to predict
         if len(current_week) == 0:
+            # Provide detailed error message with filter information
+            error_msg = 'No players available for prediction after filtering. All players were filtered out.'
+            error_details = []
+            
+            if 'training_data' in request.session:
+                training_data = pd.read_json(request.session['training_data'], orient='split')
+                error_details.append(f"Training data has {len(training_data)} records")
+            
+            from .config import EWMA_WEEKS, MODEL_PARAMS
+            error_details.append(f"EWMA_WEEKS filter: {EWMA_WEEKS} minimum records")
+            if MODEL_PARAMS.get("min_usage_filter", True):
+                error_details.append(f"min_touches_ewma filter: {MODEL_PARAMS.get('min_touches_ewma', 3.0)} minimum touches")
+            
+            error_msg += f" Filters applied: {', '.join(error_details)}"
+            error_msg += " Consider: 1) Loading data for the week first, 2) Lowering min_touches_ewma in config, or 3) Disabling min_usage_filter"
+            
             return JsonResponse({
                 'success': False,
-                'message': 'No players available for prediction after filtering. All players were filtered out (no stats or no meaningful features).'
+                'message': error_msg
             }, status=400)
         
         # Make predictions (returns tuple: predictions_df, shap_values)

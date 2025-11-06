@@ -4,11 +4,53 @@ Implements all features from the feature blueprint
 """
 import pandas as pd
 import numpy as np
-from .config import EWMA_ALPHA, EWMA_WEEKS, REGRESSION_LAMBDA
+from .config import EWMA_ALPHA, WINSORIZE_ENABLED, WINSORIZE_PERCENTILE
 
 
-def calculate_ewma_feature(series, alpha=EWMA_ALPHA):
-    """Calculate EWMA for a single feature with shift"""
+def winsorize_values(series, percentile=WINSORIZE_PERCENTILE):
+    """
+    Winsorize (cap) extreme values to prevent outliers from skewing EWMA.
+    
+    Args:
+        series: pandas Series with values to winsorize
+        percentile: Percentile to cap at (0.95 = cap at 95th percentile)
+    
+    Returns:
+        Series with extreme values capped
+    """
+    if not WINSORIZE_ENABLED or len(series) == 0:
+        return series
+    
+    # Only winsorize if we have enough non-null values
+    valid_values = series.dropna()
+    if len(valid_values) < 10:  # Need at least 10 values for meaningful percentile
+        return series
+    
+    # Calculate cap threshold
+    cap_value = valid_values.quantile(percentile)
+    
+    # Cap values at the threshold
+    capped_series = series.copy()
+    capped_series = capped_series.clip(upper=cap_value)
+    
+    return capped_series
+
+
+def calculate_ewma_feature(series, alpha=EWMA_ALPHA, winsorize=True):
+    """
+    Calculate EWMA for a single feature with shift.
+    
+    Args:
+        series: pandas Series with values to calculate EWMA on
+        alpha: EWMA decay factor
+        winsorize: Whether to winsorize values before calculating EWMA
+    
+    Returns:
+        Series with EWMA values (shifted by 1 to avoid lookahead bias)
+    """
+    if winsorize and WINSORIZE_ENABLED:
+        series = winsorize_values(series, percentile=WINSORIZE_PERCENTILE)
+    
     return series.ewm(alpha=alpha, adjust=False).mean().shift(1)
 
 
@@ -46,17 +88,10 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     # Ensure sorted by player, season, week
     player_features = player_features.sort_values(by=["player_id", "season", "week"]).reset_index(drop=True)
     
-    # Initialize all intermediate columns that will be used for EWMA calculations
-    # This ensures they exist before we try to calculate EWMA
-    player_features["yards_after_catch"] = 0
-    player_features["yards_after_contact"] = 0
+    # Initialize red_zone_touches column for EWMA calculations
     player_features["red_zone_touches"] = 0
-    player_features["end_zone_targets"] = 0
-    player_features["air_yards"] = 0
-    player_features["aDOT"] = 0
-    player_features["pass_attempts_inside10"] = 0
     
-    # Group by player to calculate EWMA features (after initializing columns)
+    # Group by player to calculate EWMA features
     player_groups = player_features.groupby("player_id", group_keys=False)
     
     # Basic counts (EWMA)
@@ -108,8 +143,6 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     player_features["touches_ewma"] = player_groups["touches"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     
     # Red zone touches (from play-by-play)
-    # Note: red_zone_touches already initialized above
-    
     if "yardline_100" in pbp.columns:
         rz_touches_list = []
         
@@ -164,10 +197,9 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
             if "red_zone_touches_from_pbp" in player_features.columns:
                 player_features["red_zone_touches"] = player_features["red_zone_touches_from_pbp"].fillna(player_features["red_zone_touches"])
                 player_features = player_features.drop("red_zone_touches_from_pbp", axis=1, errors="ignore")
-            # Ensure red_zone_touches exists (it should from initialization, but double-check)
+            # Ensure red_zone_touches exists
             if "red_zone_touches" not in player_features.columns:
                 player_features["red_zone_touches"] = 0
-            # Don't fillna - preserve NaN for players without red zone touches
     
     # Calculate EWMA for red zone touches - ensure it exists first
     if "red_zone_touches" not in player_features.columns:
@@ -177,162 +209,6 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     player_groups = player_features.groupby("player_id", group_keys=False)
     
     player_features["red_zone_touches_ewma"] = player_groups["red_zone_touches"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    
-    # Yards after catch - from play-by-play
-    # Total yards gained after the catch on completed passes
-    # Note: yards_after_catch already initialized above to 0
-    
-    if "yards_after_catch" in pbp.columns and "receiver_player_id" in pbp.columns:
-        yac_data = pbp[
-            (pbp["yards_after_catch"].notna()) & 
-            (pbp["receiver_player_id"].notna())
-        ].groupby(["receiver_player_id", "game_id", "season", "week"])["yards_after_catch"].sum().reset_index(name="yards_after_catch_sum")
-        yac_data = yac_data.rename(columns={"receiver_player_id": "player_id"})
-        
-        # Merge with a different column name to avoid suffix conflicts
-        player_features = pd.merge(
-            player_features,
-            yac_data,
-            on=["player_id", "game_id", "season", "week"],
-            how="left"
-        )
-        # Update yards_after_catch with merged values
-        if "yards_after_catch_sum" in player_features.columns:
-            player_features["yards_after_catch"] = player_features["yards_after_catch_sum"].fillna(player_features["yards_after_catch"])
-            player_features = player_features.drop("yards_after_catch_sum", axis=1, errors="ignore")
-        # Don't fillna - preserve NaN for players without yards_after_catch
-    
-    # Final safety check - ensure yards_after_catch exists before calculating EWMA
-    if "yards_after_catch" not in player_features.columns:
-        player_features["yards_after_catch"] = np.nan
-    
-    # Calculate EWMA for yards_after_catch - preserve NaN
-    player_features["yards_after_catch_ewma"] = player_groups["yards_after_catch"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    
-    # Yards after contact - may not be available, set to 0
-    # Total yards gained after first contact on rushing attempts
-    # Note: yards_after_contact already initialized above to 0
-    
-    if "yards_after_contact" in pbp.columns and "rusher_player_id" in pbp.columns:
-        rac_data = pbp[
-            (pbp["yards_after_contact"].notna()) & 
-            (pbp["rusher_player_id"].notna())
-        ].groupby(["rusher_player_id", "game_id", "season", "week"])["yards_after_contact"].sum().reset_index(name="yards_after_contact_sum")
-        rac_data = rac_data.rename(columns={"rusher_player_id": "player_id"})
-        
-        # Merge with a different column name to avoid suffix conflicts
-        player_features = pd.merge(
-            player_features,
-            rac_data,
-            on=["player_id", "game_id", "season", "week"],
-            how="left"
-        )
-        # Update yards_after_contact with merged values
-        if "yards_after_contact_sum" in player_features.columns:
-            player_features["yards_after_contact"] = player_features["yards_after_contact_sum"].fillna(player_features["yards_after_contact"])
-            player_features = player_features.drop("yards_after_contact_sum", axis=1, errors="ignore")
-        # Don't fillna - preserve NaN for players without yards_after_contact
-    
-    # Final safety check - ensure yards_after_contact exists before calculating EWMA
-    if "yards_after_contact" not in player_features.columns:
-        player_features["yards_after_contact"] = np.nan
-    
-    # Recreate player_groups to ensure it has the latest columns
-    player_groups = player_features.groupby("player_id", group_keys=False)
-    
-    # Calculate EWMA for yards_after_contact - preserve NaN
-    player_features["yards_after_contact_ewma"] = player_groups["yards_after_contact"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    
-    # End zone targets (inside 10-yard line)
-    # Note: end_zone_targets already initialized above
-    
-    if "yardline_100" in pbp.columns and "receiver_player_id" in pbp.columns and "pass" in pbp.columns:
-        ez_targets = pbp[
-            (pbp["yardline_100"] <= 10) & 
-            (pbp["pass"] == 1) & 
-            (pbp["receiver_player_id"].notna())
-        ].groupby(["receiver_player_id", "game_id", "season", "week"]).size().reset_index(name="end_zone_targets")
-        ez_targets = ez_targets.rename(columns={"receiver_player_id": "player_id"})
-        # Merge with a different column name to avoid suffix conflicts
-        ez_targets_merge = ez_targets.rename(columns={"end_zone_targets": "end_zone_targets_from_pbp"})
-        player_features = pd.merge(
-            player_features,
-            ez_targets_merge,
-            on=["player_id", "game_id", "season", "week"],
-            how="left"
-        )
-        # Update end_zone_targets with merged values
-        if "end_zone_targets_from_pbp" in player_features.columns:
-            player_features["end_zone_targets"] = player_features["end_zone_targets_from_pbp"].fillna(player_features["end_zone_targets"])
-            player_features = player_features.drop("end_zone_targets_from_pbp", axis=1, errors="ignore")
-        # Ensure end_zone_targets exists
-        if "end_zone_targets" not in player_features.columns:
-            player_features["end_zone_targets"] = 0
-        # Don't fillna - preserve NaN for players without end_zone_targets
-    
-    # Calculate EWMA for end_zone_targets - ensure it exists first
-    if "end_zone_targets" not in player_features.columns:
-        player_features["end_zone_targets"] = np.nan
-    
-    # Recreate player_groups to ensure it has the latest columns
-    player_groups = player_features.groupby("player_id", group_keys=False)
-    
-    player_features["end_zone_targets_ewma"] = player_groups["end_zone_targets"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    
-    # Make end_zone_targets_ewma NaN for RBs and QBs (only WR/TE should have this)
-    # Position will be merged in later, but we'll handle this in data_manager after position is available
-    
-    # Air yards and aDOT (average depth of target)
-    # Note: aDOT should count ALL targets (completed and incomplete), not just completions
-    # air_yards and aDOT already initialized above
-    
-    if "air_yards" in pbp.columns and "receiver_player_id" in pbp.columns:
-        # Filter for pass attempts (all targets, not just completions)
-        # air_yards should be available for all pass attempts where receiver is targeted
-        # If air_yards is null, it might mean the pass wasn't actually targeted or was a different play type
-        air_yards_data = pbp[
-            (pbp["air_yards"].notna()) & 
-            (pbp["receiver_player_id"].notna()) &
-            (pbp.get("pass", 0) == 1)  # Only pass plays
-        ].groupby(["receiver_player_id", "game_id", "season", "week"]).agg({
-            "air_yards": ["sum", "mean", "count"]
-        }).reset_index()
-        air_yards_data.columns = ["player_id", "game_id", "season", "week", "air_yards_total", "aDOT", "targets_for_adot"]
-        # Rename columns before merge to avoid conflicts
-        air_yards_data_merge = air_yards_data[["player_id", "game_id", "season", "week", "air_yards_total", "aDOT"]].rename(
-            columns={"air_yards_total": "air_yards_from_pbp", "aDOT": "aDOT_from_pbp"}
-        )
-        player_features = pd.merge(
-            player_features,
-            air_yards_data_merge,
-            on=["player_id", "game_id", "season", "week"],
-            how="left"
-        )
-        # Update with merged values
-        if "air_yards_from_pbp" in player_features.columns:
-            player_features["air_yards"] = player_features["air_yards_from_pbp"].fillna(player_features["air_yards"])
-            player_features = player_features.drop("air_yards_from_pbp", axis=1, errors="ignore")
-        if "aDOT_from_pbp" in player_features.columns:
-            player_features["aDOT"] = player_features["aDOT_from_pbp"].fillna(player_features["aDOT"])
-            player_features = player_features.drop("aDOT_from_pbp", axis=1, errors="ignore")
-        # Ensure columns exist
-        if "air_yards" not in player_features.columns:
-            player_features["air_yards"] = 0
-        if "aDOT" not in player_features.columns:
-            player_features["aDOT"] = 0
-        # Don't fillna - preserve NaN for players without air_yards/aDOT
-    
-    # Calculate EWMA for air_yards and aDOT - ensure they exist first
-    if "air_yards" not in player_features.columns:
-        player_features["air_yards"] = np.nan
-    if "aDOT" not in player_features.columns:
-        player_features["aDOT"] = np.nan
-    
-    # Recreate player_groups to ensure it has the latest columns
-    player_groups = player_features.groupby("player_id", group_keys=False)
-    
-    player_features["air_yards_ewma"] = player_groups["air_yards"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    player_features["aDOT_ewma"] = player_groups["aDOT"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     
     # Receiving stats (EWMA)
     if "receiving_yards" in player_features.columns:
@@ -356,112 +232,58 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     else:
         player_features["rushing_touchdowns_ewma"] = np.nan
     
-    # NOTE: QB stats are now calculated separately in calculate_qb_stats() function
-    # and merged onto all players by team/game/week. This prevents QB rushing stats
-    # from being confused with player rushing stats.
-    
-    # Note: designed_rush_attempts_ewma has been removed from features
-    
-    # Pass attempts inside 10 (QB stat)
-    # Note: pass_attempts_inside10 already initialized above
-    
-    if "yardline_100" in pbp.columns and "passer_player_id" in pbp.columns and "pass" in pbp.columns:
-        pass_inside10 = pbp[
-            (pbp["yardline_100"] <= 10) & 
-            (pbp["pass"] == 1) & 
-            (pbp["passer_player_id"].notna())
-        ].groupby(["passer_player_id", "game_id", "season", "week"]).size().reset_index(name="pass_attempts_inside10_from_pbp")
-        pass_inside10 = pass_inside10.rename(columns={"passer_player_id": "player_id"})
-        
-        # Merge using a temporary column name to avoid conflicts
-        player_features = pd.merge(
-            player_features,
-            pass_inside10,
-            on=["player_id", "game_id", "season", "week"],
-            how="left"
+    # Add breakout game indicators (captures recent surge in performance)
+    # These are separate from EWMA to help model learn from breakout games
+    from .config import BREAKOUT_ENABLED
+    if BREAKOUT_ENABLED:
+        from .config import (
+            BREAKOUT_RUSHING_TDS, BREAKOUT_RECEIVING_TDS,
+            BREAKOUT_RUSHING_YARDS, BREAKOUT_RECEIVING_YARDS
         )
-        # Update pass_attempts_inside10 with merged values
-        if "pass_attempts_inside10_from_pbp" in player_features.columns:
-            player_features["pass_attempts_inside10"] = player_features["pass_attempts_inside10_from_pbp"].fillna(player_features["pass_attempts_inside10"])
-            player_features = player_features.drop("pass_attempts_inside10_from_pbp", axis=1, errors="ignore")
-        # Don't fillna - preserve NaN for players without pass_attempts_inside10
-    
-    # Ensure pass_attempts_inside10 exists before calculating EWMA
-    if "pass_attempts_inside10" not in player_features.columns:
-        player_features["pass_attempts_inside10"] = np.nan
-    
-    # Recreate player_groups to ensure it has the latest columns
-    player_groups = player_features.groupby("player_id", group_keys=False)
-    
-    player_features["pass_attempts_inside10_ewma"] = player_groups["pass_attempts_inside10"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    
-    # Export data before EWMA calculations for spot checking
-    # This happens after all intermediate values are calculated but before final EWMA features
-    try:
-        import os
-        from django.conf import settings
-        base_dir = settings.BASE_DIR if hasattr(settings, 'BASE_DIR') else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        pre_ewma_path = os.path.join(base_dir, 'pre_ewma_data.csv')
-        player_features.to_csv(pre_ewma_path, index=False)
-        print(f"[Export] Saved pre-EWMA data to {pre_ewma_path} with {len(player_features)} rows and {len(player_features.columns)} columns")
-        print(f"[Export] Includes raw values: targets, receptions, carries, touches, yards_after_catch, yards_after_contact, red_zone_touches, etc.")
-    except Exception as e:
-        print(f"[Warning] Could not export pre-EWMA data: {e}")
-    
-    # TD streak factor (std deviation of TDs last 3 games)
-    if "touchdown" in player_features.columns:
-        # Recreate player_groups to ensure it has latest columns
-        player_groups = player_features.groupby("player_id", group_keys=False)
-        # Calculate rolling std deviation of touchdowns over last 3 games, shifted by 1
-        td_streak = player_groups["touchdown"].apply(
-            lambda x: x.rolling(window=EWMA_WEEKS, min_periods=1).std().shift(1)
-        )
-        # The result should be a Series aligned with player_features index
-        # Convert to Series if needed and ensure proper alignment
-        if isinstance(td_streak, pd.Series):
-            player_features["td_streak_factor"] = td_streak.reindex(player_features.index, fill_value=0)
+        
+        # Sort by player, season, week to identify "last game"
+        player_features = player_features.sort_values(by=["player_id", "season", "week"]).reset_index(drop=True)
+        
+        # Rushing TD breakout: 1 if last game had >= BREAKOUT_RUSHING_TDS rushing TDs
+        if "rushing_tds" in player_features.columns:
+            player_features["recent_rushing_td_breakout"] = player_groups["rushing_tds"].apply(
+                lambda x: (x.shift(1) >= BREAKOUT_RUSHING_TDS).astype(int)
+            )
         else:
-            # If it's a numpy array or other, convert to Series
-            player_features["td_streak_factor"] = pd.Series(td_streak, index=player_features.index, dtype=float)
-        # Don't fillna - preserve NaN for players without TD history
-    else:
-        player_features["td_streak_factor"] = np.nan
-    
-    # Regression TD factor: EWMA + λ(xTD - EWMA)
-    # xTD = expected touchdowns based on historical conversion per opportunity
-    # xTD = historical TD conversion rate * current opportunities (touches)
-    if "touchdown" in player_features.columns and "touches" in player_features.columns:
-        # Recreate player_groups to ensure it has latest columns
-        player_groups = player_features.groupby("player_id", group_keys=False)
+            player_features["recent_rushing_td_breakout"] = 0
         
-        # Calculate EWMA of touchdowns
-        td_ewma = player_groups["touchdown"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-        td_ewma = td_ewma.values if hasattr(td_ewma, 'values') else td_ewma
-        # Don't fillna - preserve NaN for players without TD history
-        td_ewma = pd.Series(td_ewma, index=player_features.index)
-        
-        # Calculate EWMA of touches (opportunities)
-        if "touches_ewma" not in player_features.columns:
-            touches_ewma = player_groups["touches"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-            touches_ewma = touches_ewma.values if hasattr(touches_ewma, 'values') else touches_ewma
-            touches_ewma = pd.Series(touches_ewma, index=player_features.index)
+        # Receiving TD breakout: 1 if last game had >= BREAKOUT_RECEIVING_TDS receiving TDs
+        if "receiving_tds" in player_features.columns:
+            player_features["recent_receiving_td_breakout"] = player_groups["receiving_tds"].apply(
+                lambda x: (x.shift(1) >= BREAKOUT_RECEIVING_TDS).astype(int)
+            )
         else:
-            touches_ewma = player_features["touches_ewma"]
+            player_features["recent_receiving_td_breakout"] = 0
         
-        # Historical conversion rate per opportunity = EWMA(TDs) / EWMA(touches)
-        # Preserve NaN if either component is NaN
-        historical_conversion_rate = td_ewma / (touches_ewma + 1)
+        # Rushing yards breakout: 1 if last game had >= BREAKOUT_RUSHING_YARDS rushing yards
+        if "rushing_yards" in player_features.columns:
+            player_features["recent_rushing_yards_breakout"] = player_groups["rushing_yards"].apply(
+                lambda x: (x.shift(1) >= BREAKOUT_RUSHING_YARDS).astype(int)
+            )
+        else:
+            player_features["recent_rushing_yards_breakout"] = 0
         
-        # xTD = current touches * historical conversion rate
-        # Preserve NaN if touches is NaN
-        xTD = player_features["touches"] * historical_conversion_rate
-        xTD = xTD.where(player_features["touches"].notna(), np.nan)
+        # Receiving yards breakout: 1 if last game had >= BREAKOUT_RECEIVING_YARDS receiving yards
+        if "receiving_yards" in player_features.columns:
+            player_features["recent_receiving_yards_breakout"] = player_groups["receiving_yards"].apply(
+                lambda x: (x.shift(1) >= BREAKOUT_RECEIVING_YARDS).astype(int)
+            )
+        else:
+            player_features["recent_receiving_yards_breakout"] = 0
         
-        # Regression factor: EWMA + λ(xTD - EWMA)
-        # Preserve NaN if components are missing
-        player_features["regression_td_factor"] = td_ewma + REGRESSION_LAMBDA * (xTD - td_ewma)
-    else:
-        player_features["regression_td_factor"] = np.nan
+        # Combined breakout indicator: 1 if any breakout occurred in last game
+        breakout_cols = [
+            "recent_rushing_td_breakout", "recent_receiving_td_breakout",
+            "recent_rushing_yards_breakout", "recent_receiving_yards_breakout"
+        ]
+        player_features["recent_breakout_game"] = (
+            player_features[breakout_cols].sum(axis=1) > 0
+        ).astype(int)
     
     return player_features
 
@@ -510,13 +332,6 @@ def calculate_team_context_features(player_features, pbp, schedules):
         team_rz_touches.groupby("team")["team_total_red_zone_touches"]
         .apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     )
-    
-    # Team total air yards
-    # Ensure air_yards exists
-    if "air_yards" not in player_features.columns:
-        player_features["air_yards"] = 0
-    
-    # Note: team_total_air_yards_ewma has been removed from features
     
     # Merge team context
     team_context = pd.merge(
@@ -622,30 +437,6 @@ def calculate_team_shares(player_features, team_context):
     )
     # Set to NaN if player has no red_zone_touches (not 0)
     df.loc[df["red_zone_touches_ewma"].isna() | (df["red_zone_touches_ewma"] == 0), "red_zone_touch_share_ewma"] = np.nan
-    
-    # Note: team_total_air_yards_ewma and air_yards_share_ewma have been removed from features
-    
-    # aDOT share (player aDOT / team aDOT)
-    # Ensure aDOT_ewma exists
-    if "aDOT_ewma" not in df.columns:
-        df["aDOT_ewma"] = 0
-    
-    team_adot = df.groupby(["team", "game_id", "season", "week"])["aDOT_ewma"].mean().reset_index(name="team_aDOT_ewma")
-    df = pd.merge(
-        df,
-        team_adot,
-        on=["team", "game_id", "season", "week"],
-        how="left"
-    )
-    if "team_aDOT_ewma" not in df.columns:
-        df["team_aDOT_ewma"] = 0
-    
-    # Calculate aDOT share - preserve NaN if player has no aDOT
-    df["aDOT_share_ewma"] = (
-        df["aDOT_ewma"] / (df["team_aDOT_ewma"] + 1)
-    )
-    # Set to NaN if player has no aDOT (not 0)
-    df.loc[df["aDOT_ewma"].isna() | (df["aDOT_ewma"] == 0), "aDOT_share_ewma"] = np.nan
     
     return df
 
@@ -777,30 +568,22 @@ def calculate_qb_stats(player_features, position_col=None):
     if "team" in qb_features.columns:
         qb_stats["team"] = qb_features["team"]
     
-    # QB passing stats (renamed to remove "rolling")
+    # QB passing stats - only yardage, not TD counts (to avoid spurious correlations)
     if "passing_yards" in qb_features.columns:
         qb_stats["qb_passing_yards_ewma"] = qb_groups["passing_yards"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     else:
         qb_stats["qb_passing_yards_ewma"] = np.nan
     
-    if "passing_tds" in qb_features.columns:
-        qb_stats["qb_passing_TDs_ewma"] = qb_groups["passing_tds"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    else:
-        qb_stats["qb_passing_TDs_ewma"] = np.nan
-    
-    # QB rushing stats (renamed to remove "rolling")
+    # QB rushing stats - only yardage, not TD counts (to avoid spurious correlations)
     if "rushing_yards" in qb_features.columns:
         qb_stats["qb_rushing_yards_ewma"] = qb_groups["rushing_yards"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     else:
         qb_stats["qb_rushing_yards_ewma"] = np.nan
     
-    if "rushing_tds" in qb_features.columns:
-        qb_stats["qb_rushing_TDs_ewma"] = qb_groups["rushing_tds"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    else:
-        qb_stats["qb_rushing_TDs_ewma"] = np.nan
+    # Note: QB TD stats removed (qb_passing_TDs_ewma, qb_rushing_TDs_ewma) to avoid spurious correlations
+    # Especially qb_rushing_TDs_ewma = 0 was causing model to over-weight RBs
     
     # Return QB stats with player_id (which is the qb_id) for merging
     # Merge will be done by qb_id, season, week in data_manager
-    return qb_stats[["player_id", "season", "week", "qb_passing_yards_ewma", "qb_passing_TDs_ewma", 
-                     "qb_rushing_yards_ewma", "qb_rushing_TDs_ewma"]].copy()
-
+    return qb_stats[["player_id", "season", "week", "qb_passing_yards_ewma", 
+                     "qb_rushing_yards_ewma"]].copy()

@@ -57,6 +57,13 @@ class MLModel(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     training_records = models.IntegerField(null=True)
     
+    # Model performance metrics
+    optimal_threshold = models.FloatField(null=True, blank=True)  # Optimized prediction threshold
+    validation_accuracy = models.FloatField(null=True, blank=True)
+    validation_f1 = models.FloatField(null=True, blank=True)
+    test_accuracy = models.FloatField(null=True, blank=True)
+    test_f1 = models.FloatField(null=True, blank=True)
+    
     class Meta:
         db_table = 'ml_models'
         indexes = [

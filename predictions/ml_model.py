@@ -24,7 +24,11 @@ from sklearn.preprocessing import OrdinalEncoder, StandardScaler
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from imblearn.over_sampling import SMOTE
-from sklearn.metrics import log_loss, classification_report, confusion_matrix
+from sklearn.metrics import (
+    log_loss, classification_report, confusion_matrix,
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, roc_curve
+)
 
 from .config import REPORT_STATUS_ORDER, MODEL_PARAMS, POSITIONS, CATEGORICAL_FEATURES
 from .models import MLModel
@@ -91,10 +95,23 @@ class NFLTouchdownModel:
                 )
             
             # Prepare data
-            X = df[["player_id"] + available_features].copy()
+            # Include position for imputation but exclude it from features
+            # Position is needed for position-aware imputation but is NOT a model feature
+            features_to_select = available_features.copy()
+            if "position" in df.columns and "position" not in features_to_select:
+                # Add position temporarily for imputation, will be removed before encoding
+                features_to_select.append("position")
+            
+            X = df[["player_id"] + features_to_select].copy()
             y = df["touchdown"].copy()
             player_ids = X["player_id"].values
             X = X.drop("player_id", axis=1)
+            
+            # Store position column for imputation, then remove from X if it's not a feature
+            position_col_for_imputation = None
+            if "position" in X.columns and "position" not in available_features:
+                position_col_for_imputation = X["position"].copy()
+                X = X.drop("position", axis=1)
             
             # Update numeric_features to only include those that exist
             available_numeric_features = [f for f in numeric_features if f in X.columns]
@@ -109,13 +126,13 @@ class NFLTouchdownModel:
                 categorical_features_to_encode.append("report_status")
                 ordinal_categories.append(REPORT_STATUS_ORDER)
             
-            # Check for position (ordinal)
-            if "position" in X.columns:
-                categorical_features_to_encode.append("position")
-                ordinal_categories.append(POSITIONS)
+            # Note: defense categorical feature removed - high cardinality causes overfitting
+            # Defense quality is captured by defensive EWMA features instead
+            
+            # Note: position is still used internally for position-aware imputation but is NOT a feature
 
             # Position-aware imputation strategy
-            # For features that don't apply to a position (e.g., air_yards for RBs), keep NaN
+            # For features that don't apply to a position (e.g., receiving stats for RBs), keep NaN
             # XGBoost can handle missing values natively, which is better than imputing with 0
             # This allows the model to learn that missing = feature doesn't apply
             
@@ -149,8 +166,7 @@ class NFLTouchdownModel:
             qb_only_features = []  # No QB-only features needed
             
             # General features (apply to all positions) - these should be imputed normally
-            # targets_ewma, receptions_ewma, touches_ewma, red_zone_touches_ewma, 
-            # red_zone_touch_share_ewma, td_streak_factor, regression_td_factor, etc.
+            # touches_ewma, red_zone_touches_ewma, red_zone_touch_share_ewma, team context, etc.
             
             # Ensure we're not including categorical features in numeric processing
             numeric_only_features = [f for f in available_numeric_features if f not in categorical_features_to_encode]
@@ -162,10 +178,11 @@ class NFLTouchdownModel:
                 # Create a copy to work with
                 X_imputed = X[numeric_only_features].copy()
                 
-                # Get position column if available
-                position_col = None
-                if "position" in X.columns:
-                    position_col = X["position"]
+                # Get position column if available (for imputation, not as a feature)
+                position_col = position_col_for_imputation if position_col_for_imputation is not None else None
+                if position_col is None and "position" in df.columns:
+                    # Fallback: try to get from original df
+                    position_col = df["position"]
                 
                 # Track which features should keep NaN for inapplicable positions
                 features_to_keep_nan = set()
@@ -249,10 +266,11 @@ class NFLTouchdownModel:
             if categorical_features_to_encode:
                 transformers = []
                 for i, cat_feature in enumerate(categorical_features_to_encode):
+                    encoder = OrdinalEncoder(categories=[ordinal_categories[i]])
                     transformers.append(
                         (
                             f"ordinal_{cat_feature}",
-                            OrdinalEncoder(categories=[ordinal_categories[i]]),
+                            encoder,
                             [cat_feature],
                         )
                     )
@@ -269,14 +287,27 @@ class NFLTouchdownModel:
 
             X_encoded = self.encoder.fit_transform(X)
 
-            # Split data
-            X_train, X_test, y_train, y_test, _, _ = train_test_split(
+            # Split data into train/validation/test (3-way split)
+            # First split: separate test set
+            X_temp, X_test, y_temp, y_test, player_ids_temp, player_ids_test = train_test_split(
                 X_encoded,
                 y,
                 player_ids,
                 test_size=MODEL_PARAMS["test_size"],
                 random_state=MODEL_PARAMS["random_state"],
             )
+            
+            # Second split: separate train and validation from remaining data
+            val_size_adjusted = MODEL_PARAMS["val_size"] / (1 - MODEL_PARAMS["test_size"])
+            X_train, X_val, y_train, y_val, player_ids_train, player_ids_val = train_test_split(
+                X_temp,
+                y_temp,
+                player_ids_temp,
+                test_size=val_size_adjusted,
+                random_state=MODEL_PARAMS["random_state"],
+            )
+            
+            print(f"[Training] Data split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
 
             # Handle NaN values before SMOTE (SMOTE doesn't accept NaN)
             # XGBoost can handle NaN natively, so we'll temporarily replace NaN with a sentinel value
@@ -300,39 +331,85 @@ class NFLTouchdownModel:
             # Convert sentinel back to NaN
             X_train_resampled = np.where(X_train_resampled == NAN_SENTINEL, np.nan, X_train_resampled)
             
-            # Also handle test set NaN with sentinel for XGBoost
+            # Also handle validation and test sets NaN with sentinel for XGBoost
+            X_val_np = np.array(X_val) if not isinstance(X_val, np.ndarray) else X_val
+            X_test_np = np.array(X_test) if not isinstance(X_test, np.ndarray) else X_test
+            X_val_np = np.where(np.isnan(X_val_np), NAN_SENTINEL, X_val_np)
             X_test_np = np.where(np.isnan(X_test_np), NAN_SENTINEL, X_test_np)
 
             # Create DMatrix (XGBoost will handle NaN natively)
             # Note: We use the sentinel value which XGBoost treats as missing
             dtrain = xgb.DMatrix(X_train_resampled, label=y_train_resampled, enable_categorical=False)
+            dval = xgb.DMatrix(X_val_np, label=y_val, enable_categorical=False)
             dtest = xgb.DMatrix(X_test_np, label=y_test, enable_categorical=False)
+            
+            # Store validation set for threshold optimization
+            self.X_val = X_val_np
+            self.y_val = y_val
 
             # Hyperparameter optimization with Optuna
             print("[Training] Optimizing hyperparameters with Optuna...")
+            print("[Training] Using validation set for early stopping and overfitting detection")
 
             def objective(trial):
                 param = {
                     "objective": MODEL_PARAMS["objective"],
                     "eval_metric": MODEL_PARAMS["eval_metric"],
-                    "max_depth": trial.suggest_int("max_depth", 3, 10),
-                    "eta": trial.suggest_float("eta", 0.01, 0.3),
-                    "subsample": trial.suggest_float("subsample", 0.6, 1.0),
+                    # Tree structure - more conservative to prevent overfitting
+                    "max_depth": trial.suggest_int("max_depth", 3, 6),  # Further reduced (3-6 instead of 3-8)
+                    "min_child_weight": trial.suggest_int("min_child_weight", 2, 10),  # Increased minimum
+                    # Learning rate and regularization - stronger regularization
+                    "eta": trial.suggest_float("eta", 0.01, 0.15, log=True),  # Lower max learning rate
+                    "lambda": trial.suggest_float("lambda", 1.0, 20.0, log=True),  # Higher L2 regularization range
+                    "alpha": trial.suggest_float("alpha", 0.1, 10.0, log=True),  # Higher L1 regularization range
+                    # Sampling for regularization
+                    "subsample": trial.suggest_float("subsample", 0.7, 1.0),  # Row sampling
+                    "colsample_bytree": trial.suggest_float("colsample_bytree", 0.7, 1.0),  # Column sampling
+                    "colsample_bylevel": trial.suggest_float("colsample_bylevel", 0.7, 1.0),  # Per-level sampling
+                    # Class imbalance
                     "scale_pos_weight": len(y_train_resampled[y_train_resampled == 0])
                     / len(y_train_resampled[y_train_resampled == 1]),
-                    "lambda": trial.suggest_float("lambda", 1e-8, 10.0),
-                    "alpha": trial.suggest_float("alpha", 1e-8, 10.0),
-                    "min_child_weight": trial.suggest_int("min_child_weight", 1, 10),
                 }
 
+                # Train with early stopping on validation set
+                evals = [(dtrain, "train"), (dval, "val")]
                 model = xgb.train(
-                    param, dtrain, num_boost_round=MODEL_PARAMS["num_boost_round"]
+                    param,
+                    dtrain,
+                    num_boost_round=MODEL_PARAMS["num_boost_round"],
+                    evals=evals,
+                    early_stopping_rounds=MODEL_PARAMS["early_stopping_rounds"],
+                    verbose_eval=False,
                 )
-                y_pred_prob = model.predict(dtest)
-                loss = log_loss(y_test, y_pred_prob)
-                return loss
+                
+                # Get predictions on validation set
+                y_pred_prob = model.predict(dval)
+                
+                # Calculate metric based on config
+                optimization_metric = MODEL_PARAMS.get("optimization_metric", "logloss")
+                if optimization_metric == "logloss":
+                    score = log_loss(y_val, y_pred_prob)
+                elif optimization_metric == "accuracy":
+                    y_pred_binary = (y_pred_prob > 0.5).astype(int)
+                    score = -accuracy_score(y_val, y_pred_binary)  # Negative for minimization
+                elif optimization_metric == "f1":
+                    y_pred_binary = (y_pred_prob > 0.5).astype(int)
+                    score = -f1_score(y_val, y_pred_binary)  # Negative for minimization
+                elif optimization_metric == "precision":
+                    y_pred_binary = (y_pred_prob > 0.5).astype(int)
+                    score = -precision_score(y_val, y_pred_binary, zero_division=0)  # Negative for minimization
+                elif optimization_metric == "recall":
+                    y_pred_binary = (y_pred_prob > 0.5).astype(int)
+                    score = -recall_score(y_val, y_pred_binary)  # Negative for minimization
+                else:
+                    score = log_loss(y_val, y_pred_prob)
+                
+                return score
 
-            study = optuna.create_study(direction="minimize")
+            study = optuna.create_study(
+                direction="minimize",
+                study_name=f"nfl_td_model_s{self.season}_w{self.week}",
+            )
             study.optimize(
                 objective,
                 n_trials=MODEL_PARAMS["optuna_trials"],
@@ -342,7 +419,8 @@ class NFLTouchdownModel:
 
             # Train final model with best params
             print(f"[Training] Best parameters: {study.best_trial.params}")
-            best_params = study.best_trial.params
+            print(f"[Training] Best validation score: {study.best_value:.4f}")
+            best_params = study.best_trial.params.copy()
             best_params.update(
                 {
                     "objective": MODEL_PARAMS["objective"],
@@ -356,25 +434,111 @@ class NFLTouchdownModel:
             # XGBoost treats NaN as missing and learns optimal split directions
             best_params["missing"] = np.nan  # Explicitly set missing value handling
             
+            # Train final model with early stopping on validation set
+            print("[Training] Training final model with early stopping...")
+            evals = [(dtrain, "train"), (dval, "val")]
             self.model = xgb.train(
-                best_params, dtrain, num_boost_round=MODEL_PARAMS["num_boost_round"]
+                best_params,
+                dtrain,
+                num_boost_round=MODEL_PARAMS["num_boost_round"],
+                evals=evals,
+                early_stopping_rounds=MODEL_PARAMS["early_stopping_rounds"],
+                verbose_eval=10,  # Print every 10 rounds
             )
+            
+            # Optimize prediction threshold based on validation set
+            if MODEL_PARAMS.get("optimize_threshold", False):
+                print("[Training] Optimizing prediction threshold...")
+                y_val_pred_prob = self.model.predict(dval)
+                fpr, tpr, thresholds = roc_curve(y_val, y_val_pred_prob)
+                
+                # Find threshold that maximizes F1 score
+                best_f1 = 0
+                best_threshold = MODEL_PARAMS["prediction_threshold"]
+                for threshold in thresholds:
+                    y_pred_binary = (y_val_pred_prob >= threshold).astype(int)
+                    f1 = f1_score(y_val, y_pred_binary)
+                    if f1 > best_f1:
+                        best_f1 = f1
+                        best_threshold = threshold
+                
+                print(f"[Training] Optimized threshold: {best_threshold:.4f} (F1: {best_f1:.4f})")
+                self.optimal_threshold = best_threshold
+            else:
+                self.optimal_threshold = MODEL_PARAMS["prediction_threshold"]
 
-            # Evaluate
-            y_pred_prob = self.model.predict(dtest)
-            y_pred_binary = [
-                1 if prob > MODEL_PARAMS["prediction_threshold"] else 0
-                for prob in y_pred_prob
-            ]
+            # Evaluate on test set
+            print("\n[Evaluation] Evaluating model on test set...")
+            y_test_pred_prob = self.model.predict(dtest)
+            y_test_pred_binary = (y_test_pred_prob >= self.optimal_threshold).astype(int)
+            
+            # Also evaluate on validation set for comparison
+            y_val_pred_prob = self.model.predict(dval)
+            y_val_pred_binary = (y_val_pred_prob >= self.optimal_threshold).astype(int)
+            
+            # Calculate comprehensive metrics
+            test_accuracy = accuracy_score(y_test, y_test_pred_binary)
+            test_precision = precision_score(y_test, y_test_pred_binary, zero_division=0)
+            test_recall = recall_score(y_test, y_test_pred_binary)
+            test_f1 = f1_score(y_test, y_test_pred_binary)
+            test_logloss = log_loss(y_test, y_test_pred_prob)
+            test_auc = roc_auc_score(y_test, y_test_pred_prob)
+            
+            val_accuracy = accuracy_score(y_val, y_val_pred_binary)
+            val_precision = precision_score(y_val, y_val_pred_binary, zero_division=0)
+            val_recall = recall_score(y_val, y_val_pred_binary)
+            val_f1 = f1_score(y_val, y_val_pred_binary)
+            val_logloss = log_loss(y_val, y_val_pred_prob)
+            val_auc = roc_auc_score(y_val, y_val_pred_prob)
+            
+            # Check for overfitting (difference between train and validation)
+            train_pred_prob = self.model.predict(dtrain)
+            train_logloss = log_loss(y_train_resampled, train_pred_prob)
+            train_accuracy = accuracy_score(y_train_resampled, (train_pred_prob >= self.optimal_threshold).astype(int))
+            
+            print("\n" + "="*60)
+            print("MODEL PERFORMANCE SUMMARY")
+            print("="*60)
+            print(f"\nValidation Set (used for early stopping):")
+            print(f"  Accuracy:  {val_accuracy:.4f}")
+            print(f"  Precision: {val_precision:.4f}")
+            print(f"  Recall:    {val_recall:.4f}")
+            print(f"  F1 Score:  {val_f1:.4f}")
+            print(f"  Log Loss:  {val_logloss:.4f}")
+            print(f"  AUC-ROC:   {val_auc:.4f}")
+            
+            print(f"\nTest Set (held-out, final evaluation):")
+            print(f"  Accuracy:  {test_accuracy:.4f}")
+            print(f"  Precision: {test_precision:.4f}")
+            print(f"  Recall:    {test_recall:.4f}")
+            print(f"  F1 Score:  {test_f1:.4f}")
+            print(f"  Log Loss:  {test_logloss:.4f}")
+            print(f"  AUC-ROC:   {test_auc:.4f}")
+            
+            print(f"\nOverfitting Check:")
+            print(f"  Train Log Loss:    {train_logloss:.4f}")
+            print(f"  Validation Log Loss: {val_logloss:.4f}")
+            print(f"  Difference:       {abs(train_logloss - val_logloss):.4f}")
+            print(f"  Train Accuracy:   {train_accuracy:.4f}")
+            print(f"  Validation Accuracy: {val_accuracy:.4f}")
+            print(f"  Difference:       {abs(train_accuracy - val_accuracy):.4f}")
+            
+            if abs(train_logloss - val_logloss) > 0.1:
+                print(f"  ⚠️  WARNING: Large gap between train and validation suggests overfitting!")
+            elif abs(train_logloss - val_logloss) > 0.05:
+                print(f"  ⚠️  CAUTION: Moderate gap - monitor for overfitting")
+            else:
+                print(f"  ✓ Good generalization (small gap)")
+            
+            print(f"\nTest Set Classification Report:")
+            print(classification_report(y_test, y_test_pred_binary))
+            print(f"\nTest Set Confusion Matrix:")
+            print(confusion_matrix(y_test, y_test_pred_binary))
+            print("="*60)
             
             # Calculate feature importance
             print("\n[Feature Importance] Calculating feature importance...")
             self._calculate_feature_importance(X_encoded, available_features)
-
-            print("\n[Evaluation] Model Performance:")
-            print(classification_report(y_test, y_pred_binary))
-            print("\nConfusion Matrix:")
-            print(confusion_matrix(y_test, y_pred_binary))
 
             # Save model and preprocessors to database
             # XGBoost save_model requires a file path, so use temporary file
@@ -412,6 +576,11 @@ class NFLTouchdownModel:
                     'scaler_stds': json.dumps(self.scaler_stds),
                     'feature_importance': json.dumps(self.feature_importance),
                     'training_records': len(df),
+                    'optimal_threshold': self.optimal_threshold,
+                    'validation_accuracy': val_accuracy,
+                    'validation_f1': val_f1,
+                    'test_accuracy': test_accuracy,
+                    'test_f1': test_f1,
                 }
             )
 
@@ -483,6 +652,12 @@ class NFLTouchdownModel:
                     self.feature_importance = {}
             else:
                 self.feature_importance = {}
+            
+            # Load optimal threshold if available
+            if hasattr(ml_model, 'optimal_threshold') and ml_model.optimal_threshold is not None:
+                self.optimal_threshold = float(ml_model.optimal_threshold)
+            else:
+                self.optimal_threshold = MODEL_PARAMS["prediction_threshold"]
             
             return True
 
@@ -629,6 +804,53 @@ class NFLTouchdownModel:
                 f"Model for Season {self.season}, Week {self.week} not found. Please train the model first."
             )
 
+        # Apply minimum usage filter to improve precision (filter out inactive players)
+        # Position-aware: QBs use different criteria than skill position players
+        # NOTE: For future weeks, this filter uses EWMA features from historical data (weeks 1-9)
+        from .config import MODEL_PARAMS
+        if MODEL_PARAMS.get("min_usage_filter", True):
+            min_touches = MODEL_PARAMS.get("min_touches_ewma", 3.0)
+            if "touches_ewma" in current_week.columns and "position" in current_week.columns:
+                before_count = len(current_week)
+                
+                # Separate filters for QBs vs other positions
+                is_qb = current_week["position"] == "QB"
+                is_skill_position = ~is_qb
+                
+                # For skill positions (WR/TE/RB): use touches_ewma or red_zone_touches_ewma
+                has_min_touches = current_week["touches_ewma"].notna() & (current_week["touches_ewma"] >= min_touches)
+                has_red_zone = False
+                if "red_zone_touches_ewma" in current_week.columns:
+                    has_red_zone = current_week["red_zone_touches_ewma"].notna() & (current_week["red_zone_touches_ewma"] > 0)
+                
+                # For QBs: must have rushing attempts (carries_ewma) since they score rushing TDs
+                # QBs with low rushing attempts shouldn't be predicted
+                qb_has_rushing = False
+                if "carries_ewma" in current_week.columns:
+                    # QBs need at least some rushing attempts to be legitimate TD threats
+                    qb_min_carries = 2.0  # Lower threshold for QBs (they don't rush as much)
+                    qb_has_rushing = current_week["carries_ewma"].notna() & (current_week["carries_ewma"] >= qb_min_carries)
+                qb_has_red_zone = False
+                if "red_zone_touches_ewma" in current_week.columns:
+                    # QBs can also pass if they have red zone rushing attempts
+                    qb_has_red_zone = current_week["red_zone_touches_ewma"].notna() & (current_week["red_zone_touches_ewma"] > 0)
+                
+                # Combine: skill positions use touches/red_zone, QBs use carries/red_zone
+                skill_position_mask = is_skill_position & (has_min_touches | has_red_zone)
+                qb_mask = is_qb & (qb_has_rushing | qb_has_red_zone)
+                keep_mask = skill_position_mask | qb_mask
+                
+                current_week = current_week[keep_mask].copy()
+                after_count = len(current_week)
+                if before_count > after_count:
+                    removed_qbs = (is_qb & ~qb_mask).sum()
+                    removed_skill = (is_skill_position & ~skill_position_mask).sum()
+                    print(f"[Filter] Removed {before_count - after_count} players:")
+                    print(f"  - {removed_qbs} QBs (low carries_ewma or no red zone touches)")
+                    print(f"  - {removed_skill} skill positions (low touches_ewma or no red zone touches)")
+                elif len(current_week) == 0:
+                    print(f"[Warning] All players filtered out by min_usage_filter. Consider adjusting thresholds or disabling filter")
+
         try:
             # Validate required columns
             if "player_id" not in current_week.columns:
@@ -648,9 +870,20 @@ class NFLTouchdownModel:
                 )
             
             # Prepare data
-            X = current_week[["player_id"] + available_features].copy()
+            # Include position for imputation but exclude it from features
+            features_to_select = available_features.copy()
+            if "position" in current_week.columns and "position" not in features_to_select:
+                features_to_select.append("position")
+            
+            X = current_week[["player_id"] + features_to_select].copy()
             player_ids = X["player_id"].values
             X = X.drop("player_id", axis=1)
+            
+            # Store position column for imputation, then remove from X if it's not a feature
+            position_col_for_imputation = None
+            if "position" in X.columns and "position" not in available_features:
+                position_col_for_imputation = X["position"].copy()
+                X = X.drop("position", axis=1)
             
             # Track which features were NaN BEFORE preprocessing
             # This is important for SHAP - we don't want to show contributions for features that don't apply
@@ -665,7 +898,8 @@ class NFLTouchdownModel:
             available_numeric_features = [f for f in numeric_features if f in X.columns]
             
             # Filter out categorical features from numeric processing
-            categorical_features = ["position", "report_status"]
+            # Note: position is used internally for imputation but is NOT a feature
+            categorical_features = ["report_status"]  # defense removed
             numeric_only_features = [f for f in available_numeric_features if f not in categorical_features]
 
             # Apply preprocessing with position-aware handling (same as training)
@@ -673,10 +907,11 @@ class NFLTouchdownModel:
                 # Use position-aware imputation similar to training
                 X_imputed = X[numeric_only_features].copy()
                 
-                # Get position column if available
-                position_col = None
-                if "position" in X.columns:
-                    position_col = X["position"]
+                # Get position column if available (for imputation, not as a feature)
+                position_col = position_col_for_imputation if position_col_for_imputation is not None else None
+                if position_col is None and "position" in current_week.columns:
+                    # Fallback: try to get from original current_week
+                    position_col = current_week["position"]
                 
                 # Apply same position-aware imputation logic as training
                 # WR/TE receiving features (most significant for WR/TE, NaN for RB/QB)
@@ -785,7 +1020,7 @@ class NFLTouchdownModel:
                             
                             # CRITICAL: If the feature was NaN in the original data (doesn't apply),
                             # set SHAP contribution to 0 to avoid misleading explanations
-                            # This prevents showing "air_yards_share_ewma +50%" when the value was actually NaN
+                            # This prevents showing feature contributions when the value was actually NaN
                             if feature in original_nan_mask and original_nan_mask[feature].iloc[i]:
                                 shap_contrib = 0.0
                             
@@ -851,8 +1086,10 @@ class NFLTouchdownModel:
                     if pd.notna(output["touchdown"].values[i])
                 ]
 
+                # Use optimal threshold if available, otherwise use default
+                threshold = getattr(self, 'optimal_threshold', MODEL_PARAMS["prediction_threshold"])
                 y_pred_binary = [
-                    1 if prob > MODEL_PARAMS["prediction_threshold"] else 0
+                    1 if prob >= threshold else 0
                     for prob in filtered_probs
                 ]
 
