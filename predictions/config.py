@@ -34,13 +34,10 @@ FEATURES = [
     "rushing_touchdowns_ewma", # player_stats
     "red_zone_touches_ewma", 
     "red_zone_touch_share_ewma",
-    "end_zone_targets_ewma",
-    "designed_rush_attempts_ewma",
     
     # Team Context (EWMA)
     "team_play_volume_ewma",
     "team_total_red_zone_touches_ewma",
-    "team_total_air_yards_ewma",
     "team_win_probability",
     "spread_line",
     
@@ -52,8 +49,10 @@ FEATURES = [
     "opponent_red_zone_def_rank",
     
     # QB Context (EWMA)
-    "qb_rolling_rushing_yards_ewma",
-    "qb_rolling_rushing_TDs_ewma",
+    "qb_passing_yards_ewma",
+    "qb_passing_TDs_ewma",
+    "qb_rushing_yards_ewma",
+    "qb_rushing_TDs_ewma",
     
     # Player Identity / Categorical Features
     "position",
@@ -71,13 +70,10 @@ NUMERIC_FEATURES = [
     "rushing_touchdowns_ewma",
     "red_zone_touches_ewma",
     "red_zone_touch_share_ewma",
-    "end_zone_targets_ewma",
-    "designed_rush_attempts_ewma",
     
     # Team Context (EWMA)
     "team_play_volume_ewma",
     "team_total_red_zone_touches_ewma",
-    "team_total_air_yards_ewma",
     "team_win_probability",
     "spread_line",
     
@@ -89,8 +85,10 @@ NUMERIC_FEATURES = [
     "opponent_red_zone_def_rank",
     
     # QB Context (EWMA)
-    "qb_rolling_rushing_yards_ewma",
-    "qb_rolling_rushing_TDs_ewma",
+    "qb_passing_yards_ewma",
+    "qb_passing_TDs_ewma",
+    "qb_rushing_yards_ewma",
+    "qb_rushing_TDs_ewma",
 ]
 
 CATEGORICAL_FEATURES = [

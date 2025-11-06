@@ -120,27 +120,33 @@ class NFLTouchdownModel:
             # This allows the model to learn that missing = feature doesn't apply
             
             # Define position-specific feature groups based on feature specifications
-            # WR/TE only features (receiving)
-            wr_te_features = [
-                "end_zone_targets_ewma",     # WR/TE only
+            # These features should be NaN for inapplicable positions (not 0)
+            # - WR/TE receiving features: applicable to WR/TE, NaN for RB/QB
+            # - RB/QB rushing features: applicable to RB/QB, NaN for WR/TE
+            # - WR/TE rushing features: NaN for WR/TE (rushing is less significant)
+            # - RB receiving features: NaN for RB (receiving is less significant)
+            # - QB receiving features: NaN for QB (QBs never catch)
+            
+            # WR/TE receiving features (most significant for WR/TE)
+            wr_te_receiving_features = [
+                "targets_ewma",
+                "receptions_ewma", 
+                "receiving_yards_ewma",
+                "receiving_touchdowns_ewma",
             ]
             
-            # RB only features (rushing)
-            rb_only_features = [
-                # No RB-only features after removing yards_after_contact_ewma
+            # RB/QB rushing features (most significant for RB/QB)
+            rb_qb_rushing_features = [
+                "carries_ewma",
+                "rushing_yards_ewma",
+                "rushing_touchdowns_ewma",
             ]
             
-            # RB/QB features (rushing)
-            rb_qb_features = [
-                "carries_ewma",              # RB/QB only
-            ]
-            
-            # QB only features
-            qb_only_features = [
-                "designed_rush_attempts_ewma",  # QB only
-                "qb_rolling_rushing_yards_ewma",  # QB only
-                "qb_rolling_rushing_TDs_ewma",    # QB only
-            ]
+            # Legacy position groups (kept for compatibility)
+            wr_te_features = []  # No WR/TE-only features needed
+            rb_only_features = []  # No RB-only features needed
+            rb_qb_features = ["carries_ewma"]  # RB/QB rushing
+            qb_only_features = []  # No QB-only features needed
             
             # General features (apply to all positions) - these should be imputed normally
             # targets_ewma, receptions_ewma, touches_ewma, red_zone_touches_ewma, 
@@ -169,17 +175,27 @@ class NFLTouchdownModel:
                     if feature in X_imputed.columns:
                         # Determine which positions this feature applies to
                         applicable_positions = None
-                        if feature in wr_te_features:
-                            applicable_positions = ["WR", "TE"]  # WR/TE only
+                        
+                        # WR/TE receiving features (most significant for WR/TE, NaN for RB/QB)
+                        if feature in wr_te_receiving_features:
+                            applicable_positions = ["WR", "TE"]
+                            features_to_keep_nan.add(feature)
+                        # RB/QB rushing features (most significant for RB/QB, NaN for WR/TE)
+                        elif feature in rb_qb_rushing_features:
+                            applicable_positions = ["RB", "QB"]
+                            features_to_keep_nan.add(feature)
+                        # Legacy position groups (for backward compatibility)
+                        elif feature in wr_te_features:
+                            applicable_positions = ["WR", "TE"]
                             features_to_keep_nan.add(feature)
                         elif feature in rb_only_features:
-                            applicable_positions = ["RB"]  # RB only
+                            applicable_positions = ["RB"]
                             features_to_keep_nan.add(feature)
                         elif feature in rb_qb_features:
-                            applicable_positions = ["RB", "QB"]  # RB/QB only
+                            applicable_positions = ["RB", "QB"]
                             features_to_keep_nan.add(feature)
                         elif feature in qb_only_features:
-                            applicable_positions = ["QB"]  # QB only
+                            applicable_positions = ["QB"]
                             features_to_keep_nan.add(feature)
                         
                         if applicable_positions and position_col is not None:
@@ -195,7 +211,7 @@ class NFLTouchdownModel:
                                     X_imputed.loc[mask & X_imputed[feature].isna(), feature] = 0
                             # For non-applicable positions, keep NaN (XGBoost will handle it)
                         else:
-                            # General feature (team, defense, etc.) - use mean imputation for all
+                            # General feature (team, defense, touches, etc.) - use mean imputation for all
                             mean_val = X_imputed[feature].mean()
                             if pd.notna(mean_val):
                                 X_imputed[feature] = X_imputed[feature].fillna(mean_val)
@@ -663,27 +679,46 @@ class NFLTouchdownModel:
                     position_col = X["position"]
                 
                 # Apply same position-aware imputation logic as training
-                wr_te_features = [
-                    "end_zone_targets_ewma",
+                # WR/TE receiving features (most significant for WR/TE, NaN for RB/QB)
+                wr_te_receiving_features = [
+                    "targets_ewma",
+                    "receptions_ewma", 
+                    "receiving_yards_ewma",
+                    "receiving_touchdowns_ewma",
                 ]
+                
+                # RB/QB rushing features (most significant for RB/QB, NaN for WR/TE)
+                rb_qb_rushing_features = [
+                    "carries_ewma",
+                    "rushing_yards_ewma",
+                    "rushing_touchdowns_ewma",
+                ]
+                
+                # Legacy position groups (for backward compatibility)
+                wr_te_features = []
                 rb_only_features = []
                 rb_qb_features = ["carries_ewma"]
-                qb_only_features = [
-                    "designed_rush_attempts_ewma",
-                    "qb_rolling_rushing_yards_ewma", "qb_rolling_rushing_TDs_ewma"
-                ]
+                qb_only_features = []
                 
                 for feature in numeric_only_features:
                     if feature in X_imputed.columns:
                         applicable_positions = None
-                        if feature in wr_te_features:
-                            applicable_positions = ["WR", "TE"]  # WR/TE only
+                        
+                        # WR/TE receiving features
+                        if feature in wr_te_receiving_features:
+                            applicable_positions = ["WR", "TE"]
+                        # RB/QB rushing features
+                        elif feature in rb_qb_rushing_features:
+                            applicable_positions = ["RB", "QB"]
+                        # Legacy position groups
+                        elif feature in wr_te_features:
+                            applicable_positions = ["WR", "TE"]
                         elif feature in rb_only_features:
-                            applicable_positions = ["RB"]  # RB only
+                            applicable_positions = ["RB"]
                         elif feature in rb_qb_features:
-                            applicable_positions = ["RB", "QB"]  # RB/QB only
+                            applicable_positions = ["RB", "QB"]
                         elif feature in qb_only_features:
-                            applicable_positions = ["QB"]  # QB only
+                            applicable_positions = ["QB"]
                         
                         if applicable_positions and position_col is not None:
                             # Only impute for applicable positions
@@ -695,9 +730,9 @@ class NFLTouchdownModel:
                                     X_imputed.loc[mask & X_imputed[feature].isna(), feature] = mean_val
                                 else:
                                     X_imputed.loc[mask & X_imputed[feature].isna(), feature] = 0
-                            # For non-applicable positions, keep NaN
+                            # For non-applicable positions, keep NaN (already set in data_manager)
                         else:
-                            # General feature - use training mean
+                            # General feature (team, defense, touches, etc.) - use training mean
                             if feature in self.scaler_means:
                                 mean_val = self.scaler_means[feature]
                                 if pd.notna(mean_val):

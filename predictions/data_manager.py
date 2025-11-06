@@ -638,20 +638,103 @@ class NFLDataManager:
         )
         player_features_df = calculate_player_features(player_stats, pbp, weekly_stats_with_game)
         
-        # Add team column to player_features_df for team context calculations
-        # Merge team from df to player_features_df
-        if "team" not in player_features_df.columns:
-            team_mapping = df[["player_id", "game_id", "season", "week", "team"]].drop_duplicates()
-            merge_cols = ["player_id", "season", "week"]
-            if "game_id" in player_features_df.columns:
-                merge_cols.append("game_id")
+        # Add team and position columns to player_features_df for team context and QB stats calculations
+        # Merge team and position from df to player_features_df
+        team_pos_mapping = df[["player_id", "game_id", "season", "week", "team", "position"]].drop_duplicates()
+        merge_cols = ["player_id", "season", "week"]
+        if "game_id" in player_features_df.columns:
+            merge_cols.append("game_id")
+        player_features_df = pd.merge(
+            player_features_df,
+            team_pos_mapping,
+            on=merge_cols,
+            how="left"
+        )
+        print(f"[Debug] Added team and position columns to player_features_df")
+        
+        # Note: end_zone_targets_ewma has been removed from features
+        # Red zone touches now covers both targets and carries for all positions
+        
+        # Set position-inapplicable stats to NaN (not 0) to indicate feature doesn't apply
+        # This allows the model to distinguish between "0 = no activity" vs "NaN = feature doesn't apply"
+        # - QBs: receiving stats = NaN (QBs never catch the ball)
+        # - WR/TE: rushing stats = NaN (rushing is not their primary way to score)
+        # - RB: receiving stats = NaN (receiving is less significant, 0 receiving is normal)
+        # For applicable positions, 0 is valid (means they had no activity in that category)
+        if "position" in player_features_df.columns:
+            # QB receiving stats
+            qb_mask = player_features_df["position"] == "QB"
+            qb_receiving_features = ["targets_ewma", "receptions_ewma", "receiving_yards_ewma", "receiving_touchdowns_ewma"]
+            for feature in qb_receiving_features:
+                if feature in player_features_df.columns:
+                    player_features_df.loc[qb_mask, feature] = np.nan
+            print(f"[Debug] Set receiving stats to NaN for {qb_mask.sum()} QB players")
+            
+            # WR/TE rushing stats (rushing is less significant for WR/TE)
+            wr_te_mask = player_features_df["position"].isin(["WR", "TE"])
+            wr_te_rushing_features = ["carries_ewma", "rushing_yards_ewma", "rushing_touchdowns_ewma"]
+            for feature in wr_te_rushing_features:
+                if feature in player_features_df.columns:
+                    player_features_df.loc[wr_te_mask, feature] = np.nan
+            print(f"[Debug] Set rushing stats to NaN for {wr_te_mask.sum()} WR/TE players")
+            
+            # RB receiving stats (receiving is less significant for RB)
+            rb_mask = player_features_df["position"] == "RB"
+            rb_receiving_features = ["targets_ewma", "receptions_ewma", "receiving_yards_ewma", "receiving_touchdowns_ewma"]
+            for feature in rb_receiving_features:
+                if feature in player_features_df.columns:
+                    player_features_df.loc[rb_mask, feature] = np.nan
+            print(f"[Debug] Set receiving stats to NaN for {rb_mask.sum()} RB players")
+        
+        # Calculate QB stats separately (only for QBs, then will merge onto all players)
+        from .feature_engineering import calculate_qb_stats
+        print(f"[Debug] Calculating QB stats for merging onto all players...")
+        qb_stats_df = calculate_qb_stats(player_features_df, position_col=player_features_df.get("position"))
+        
+        # Merge QB stats onto all players by qb_id, season, week
+        # qb_stats_df has player_id (which is the qb_id), season, week, and QB stats
+        # df has qb_id column that identifies which QB played for each player's team
+        if len(qb_stats_df) > 0 and "qb_id" in df.columns:
+            # Drop existing QB stat columns from player_features_df if they exist
+            qb_stat_cols = ["qb_passing_yards_ewma", "qb_passing_TDs_ewma",
+                           "qb_rushing_yards_ewma", "qb_rushing_TDs_ewma"]
+            for col in qb_stat_cols:
+                if col in player_features_df.columns:
+                    player_features_df = player_features_df.drop(columns=[col])
+            
+            # First, merge qb_id from df onto player_features_df
+            if "qb_id" not in player_features_df.columns:
+                # Get qb_id from df by player_id, season, week
+                qb_id_map = df[["player_id", "season", "week", "qb_id"]].drop_duplicates()
+                player_features_df = pd.merge(
+                    player_features_df,
+                    qb_id_map,
+                    on=["player_id", "season", "week"],
+                    how="left"
+                )
+            
+            # Rename qb_stats_df player_id to qb_id for merging
+            qb_stats_for_merge = qb_stats_df.rename(columns={"player_id": "qb_id"})
+            
+            # Merge QB stats onto player_features_df by qb_id, season, week
             player_features_df = pd.merge(
                 player_features_df,
-                team_mapping,
-                on=merge_cols,
+                qb_stats_for_merge[["qb_id", "season", "week"] + qb_stat_cols],
+                on=["qb_id", "season", "week"],
                 how="left"
             )
-            print(f"[Debug] Added team column to player_features_df")
+            
+            # Set QB stats to NaN for QBs themselves (they should only have their personal stats)
+            if "position" in player_features_df.columns:
+                qb_mask = player_features_df["position"] == "QB"
+                for col in qb_stat_cols:
+                    if col in player_features_df.columns:
+                        player_features_df.loc[qb_mask, col] = np.nan
+                print(f"[Debug] Set QB stats to NaN for {qb_mask.sum()} QB players (they use personal stats)")
+            
+            print(f"[Debug] Merged QB stats onto all players by qb_id, season, week")
+        else:
+            print(f"[Warning] Could not merge QB stats - qb_stats_df is empty or qb_id column missing from df")
         
         # Merge player features back (exclude base columns that are already in df)
         # Drop base stat columns that exist in both df and player_features_df to avoid _feat suffixes
@@ -689,7 +772,7 @@ class NFLDataManager:
         team_context = calculate_team_context_features(player_features_df, pbp, schedules)
         
         # Drop any existing team context columns from df to avoid merge conflicts
-        team_context_cols = ["team_total_red_zone_touches_ewma", "team_total_air_yards_ewma", 
+        team_context_cols = ["team_total_red_zone_touches_ewma", 
                              "team_play_volume_ewma", "team_win_probability", "spread_line"]
         for col in team_context_cols:
             if col in df.columns:
@@ -749,6 +832,23 @@ class NFLDataManager:
         # Clean data
         df = df.drop_duplicates()
         print(f"[Debug] df after drop_duplicates: {len(df)} records")
+
+        # Filter out players with fewer than EWMA_WEEKS total records (minimum history requirement)
+        # This ensures EWMA features have meaningful values
+        # NOTE: This counts ALL records across ALL historical seasons (including 2022 if HISTORICAL_SEASONS=3)
+        # So a player who played 5 games in 2022 and nothing else will be included in training
+        # This filter applies to both training data and ensures only players with sufficient history are used
+        from .config import EWMA_WEEKS
+        if "player_id" in df.columns:
+            player_record_counts = df.groupby("player_id").size()
+            players_with_enough_history = player_record_counts[player_record_counts >= EWMA_WEEKS].index
+            before_count = len(df)
+            df = df[df["player_id"].isin(players_with_enough_history)].copy()
+            after_count = len(df)
+            if before_count > after_count:
+                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} total records from training data")
+                print(f"[Filter] Remaining players: {len(players_with_enough_history)} ({after_count} records)")
+                print(f"[Filter] This includes players from all historical seasons (2022+) as long as they have >= {EWMA_WEEKS} total games")
 
         # Filter out players marked as "Out" (if report_status exists)
         if "report_status" in df.columns:

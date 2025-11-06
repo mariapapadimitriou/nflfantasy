@@ -12,5 +12,6 @@ urlpatterns = [
     path('api/predict-week/', views.predict_week_view, name='predict_week'),
     path('api/export-predictions/', views.export_predictions, name='export_predictions'),
     path('api/check-model/', views.check_model_exists, name='check_model'),
+    path('api/feature-data/', views.get_feature_data, name='feature_data'),
 ]
 

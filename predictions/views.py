@@ -11,6 +11,7 @@ from django.contrib import messages
 from django.conf import settings
 from functools import wraps
 import pandas as pd
+import numpy as np
 import traceback
 
 from .config import FEATURES, NUMERIC_FEATURES
@@ -253,6 +254,36 @@ def predict_week_view(request):
         # Get current week data from session (NaN values will be preserved)
         current_week = pd.read_json(request.session['current_week_data'], orient='split')
         
+        # Filter players with fewer than EWMA_WEEKS records (minimum history requirement)
+        # NOTE: This counts total records across ALL historical seasons (including 2022) + current week
+        # So a player with 5 games in 2022 and nothing else will be included if current week makes >= 4 total
+        # This ensures consistent filtering between training and predictions
+        from .config import EWMA_WEEKS
+        if 'training_data' in request.session:
+            training_data = pd.read_json(request.session['training_data'], orient='split')
+            # Count total records per player (historical + current week)
+            # Historical includes all seasons from min_season (e.g., 2022 if season=2025, HISTORICAL_SEASONS=3)
+            all_data = pd.concat([training_data[["player_id"]], current_week[["player_id"]]], ignore_index=True)
+            player_record_counts = all_data.groupby("player_id").size()
+            players_with_enough_history = player_record_counts[player_record_counts >= EWMA_WEEKS].index
+            before_count = len(current_week)
+            current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
+            after_count = len(current_week)
+            if before_count > after_count:
+                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} total records from predictions")
+                print(f"[Filter] Count includes all historical seasons (2022+) + current week")
+        else:
+            # If no training data, count only current week records (should be 0, but handle edge case)
+            player_record_counts = current_week.groupby("player_id").size()
+            players_with_enough_history = player_record_counts[player_record_counts >= EWMA_WEEKS].index
+            before_count = len(current_week)
+            current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
+            after_count = len(current_week)
+            if before_count > after_count:
+                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} records from predictions")
+            if len(current_week) == 0:
+                print(f"[Warning] No players have >= {EWMA_WEEKS} records. This is expected for early weeks.")
+        
         # Filter out players who haven't played (no stats) - they shouldn't be predicted
         # Only filter if 'played' column exists
         if 'played' in current_week.columns:
@@ -284,16 +315,10 @@ def predict_week_view(request):
                     has_feature = current_week[feature].notna() & (current_week[feature] > 0)
                     has_stats = has_stats | has_feature
             
-            # Also check for position-specific stats that might indicate activity
-            # For WR/TE: end_zone_targets_ewma
-            if 'end_zone_targets_ewma' in current_week.columns:
-                wr_te_stats = current_week['end_zone_targets_ewma'].notna() & (current_week['end_zone_targets_ewma'] > 0)
-                has_stats = has_stats | wr_te_stats
+            # Position-specific stats are already covered by red_zone_touches_ewma
+            # (which includes both targets and carries in the red zone)
             
-            # For RB/QB: designed_rush_attempts_ewma
-            if 'designed_rush_attempts_ewma' in current_week.columns:
-                qb_stats = current_week['designed_rush_attempts_ewma'].notna() & (current_week['designed_rush_attempts_ewma'] > 0)
-                has_stats = has_stats | qb_stats
+            # Note: designed_rush_attempts_ewma has been removed from features
             
             # For red zone activity
             if 'red_zone_touches_ewma' in current_week.columns:
@@ -400,6 +425,131 @@ def predict_week_view(request):
         return JsonResponse({
             'success': False,
             'message': f'Error making predictions: {str(e)}',
+            'traceback': traceback.format_exc()
+        }, status=500)
+
+
+@json_response_view
+@require_http_methods(["POST"])
+def get_feature_data(request):
+    """Get feature data (X table) for current week predictions"""
+    try:
+        if not request.body:
+            return JsonResponse({
+                'success': False,
+                'message': 'Request body is empty.'
+            }, status=400)
+        
+        data = json.loads(request.body.decode('utf-8'))
+        season = int(data.get('season'))
+        week = int(data.get('week'))
+        
+        # Check if current week data exists in session
+        if 'current_week_data' not in request.session:
+            return JsonResponse({
+                'success': False,
+                'message': 'Please load data first before viewing features.'
+            }, status=400)
+        
+        # Get current week data from session
+        current_week = pd.read_json(request.session['current_week_data'], orient='split')
+        
+        # Apply same filters as predict_week_view
+        from .config import EWMA_WEEKS, FEATURES
+        
+        # Filter players with fewer than EWMA_WEEKS records
+        # NOTE: Same logic as predict_week_view - counts total records across ALL historical seasons (including 2022) + current week
+        if 'training_data' in request.session:
+            training_data = pd.read_json(request.session['training_data'], orient='split')
+            all_data = pd.concat([training_data[["player_id"]], current_week[["player_id"]]], ignore_index=True)
+            player_record_counts = all_data.groupby("player_id").size()
+            players_with_enough_history = player_record_counts[player_record_counts >= EWMA_WEEKS].index
+            current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
+        
+        # Filter out players who haven't played
+        if 'played' in current_week.columns:
+            current_week = current_week[current_week['played'] == 1].copy()
+        
+        # Additional filter: Remove players with no meaningful stats
+        if len(current_week) > 0:
+            key_usage_features = ['targets_ewma', 'receptions_ewma', 'carries_ewma', 'touches_ewma']
+            has_stats = pd.Series(False, index=current_week.index)
+            
+            for feature in key_usage_features:
+                if feature in current_week.columns:
+                    has_feature = current_week[feature].notna() & (current_week[feature] > 0)
+                    has_stats = has_stats | has_feature
+            
+            if 'red_zone_touches_ewma' in current_week.columns:
+                rz_stats = current_week['red_zone_touches_ewma'].notna() & (current_week['red_zone_touches_ewma'] > 0)
+                has_stats = has_stats | rz_stats
+            
+            # Note: designed_rush_attempts_ewma has been removed from features
+            
+            players_with_stats = has_stats.sum()
+            min_players_needed = min(10, max(1, len(current_week) // 2))
+            
+            if players_with_stats >= min_players_needed:
+                current_week = current_week[has_stats].copy()
+        
+        # Select only feature columns + player identifying info
+        # This matches exactly what goes into the model (X matrix)
+        display_cols = ['player_id', 'player_name', 'team', 'position', 'against', 'season', 'week']
+        
+        # Get features that exist in current_week (same as what predict_week does)
+        available_features = [f for f in FEATURES if f in current_week.columns]
+        missing_features = [f for f in FEATURES if f not in current_week.columns]
+        
+        if missing_features:
+            print(f"[Warning] Missing features in feature data view: {missing_features}")
+            print(f"[Info] Showing {len(available_features)} available features out of {len(FEATURES)} requested")
+        
+        # Combine display columns and feature columns
+        # Order: display_cols first, then features (same order as FEATURES)
+        all_cols = display_cols + available_features
+        
+        # Filter to only columns that exist
+        available_cols = [col for col in all_cols if col in current_week.columns]
+        feature_df = current_week[available_cols].copy()
+        
+        # Sort by player_name for easier viewing
+        if 'player_name' in feature_df.columns:
+            feature_df = feature_df.sort_values('player_name').reset_index(drop=True)
+        
+        # Convert to records for JSON serialization
+        records = feature_df.to_dict('records')
+        
+        # Clean NaN values
+        for record in records:
+            for key, value in record.items():
+                try:
+                    if pd.isna(value):
+                        record[key] = None
+                    elif isinstance(value, (np.integer, np.floating)):
+                        record[key] = float(value) if pd.notna(value) else None
+                    elif isinstance(value, np.bool_):
+                        record[key] = bool(value)
+                except (TypeError, ValueError):
+                    pass
+        
+        return JsonResponse({
+            'success': True,
+            'data': records,
+            'columns': available_cols,
+            'feature_columns': available_features,  # Use available_features instead of feature_cols
+            'display_columns': display_cols,
+            'missing_features': missing_features,
+            'season': season,
+            'week': week,
+            'row_count': len(records),
+            'feature_count': len(available_features),
+            'total_features_requested': len(FEATURES)
+        })
+        
+    except Exception as e:
+        return JsonResponse({
+            'success': False,
+            'message': f'Error loading feature data: {str(e)}',
             'traceback': traceback.format_exc()
         }, status=500)
 

@@ -39,6 +39,7 @@
             <button id="train-model-btn" class="btn btn-primary">Train Model</button>
             <button id="retrain-model-btn" class="btn btn-secondary">Retrain Model</button>
             <button id="predict-week-btn" class="btn btn-primary">Predict Week</button>
+            <button id="view-features-btn" class="btn btn-primary">View Features</button>
             <button id="export-btn" class="btn btn-outline">Export CSV</button>
         </div>
 
@@ -49,13 +50,59 @@
             <p>Processing...</p>
         </div>
 
-        <div id="predictions-table-container" class="table-container" style="display: none;">
-            <table id="predictions-table" class="predictions-table">
-                <thead id="table-head">
-                </thead>
-                <tbody id="table-body">
-                </tbody>
-            </table>
+        <!-- Tab Navigation -->
+        <div class="tabs-container" style="display: none;">
+            <div class="tabs">
+                <button class="tab-button active" data-tab="predictions">Predictions</button>
+                <button class="tab-button" data-tab="features">Feature Data</button>
+            </div>
+        </div>
+
+        <!-- Predictions Tab Content -->
+        <div id="predictions-tab" class="tab-content active">
+            <div id="predictions-table-container" class="table-container" style="display: none;">
+                <table id="predictions-table" class="predictions-table">
+                    <thead id="table-head">
+                    </thead>
+                    <tbody id="table-body">
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Features Tab Content -->
+        <div id="features-tab" class="tab-content" style="display: none;">
+            <div id="features-table-container" class="table-container" style="display: none;">
+                <div class="features-info">
+                    <p id="features-info-text"></p>
+                </div>
+                <div class="table-controls">
+                    <div class="search-control">
+                        <label for="features-search">Search:</label>
+                        <input type="text" id="features-search" placeholder="Search players, teams, positions...">
+                        <button id="clear-search" class="btn-clear" style="display: none;">Clear</button>
+                    </div>
+                    <div class="sort-control">
+                        <label for="features-sort">Sort by:</label>
+                        <select id="features-sort">
+                            <option value="">-- Select Column --</option>
+                        </select>
+                        <button id="sort-asc" class="btn-sort" title="Sort Ascending">↑</button>
+                        <button id="sort-desc" class="btn-sort" title="Sort Descending">↓</button>
+                    </div>
+                </div>
+                <div class="table-stats">
+                    <span id="features-count">0</span> players shown
+                </div>
+                <div class="table-wrapper">
+                    <table id="features-table" class="predictions-table sortable">
+                        <thead id="features-table-head">
+                        </thead>
+                        <tbody id="features-table-body">
+                        </tbody>
+                    </table>
+                </div>
+            </div>
         </div>
 
         <!-- Feature Explanation Modal -->

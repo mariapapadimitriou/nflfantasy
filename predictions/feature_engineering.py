@@ -54,7 +54,6 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     player_features["end_zone_targets"] = 0
     player_features["air_yards"] = 0
     player_features["aDOT"] = 0
-    player_features["designed_rush_attempts"] = 0
     player_features["pass_attempts_inside10"] = 0
     
     # Group by player to calculate EWMA features (after initializing columns)
@@ -280,6 +279,9 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     
     player_features["end_zone_targets_ewma"] = player_groups["end_zone_targets"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     
+    # Make end_zone_targets_ewma NaN for RBs and QBs (only WR/TE should have this)
+    # Position will be merged in later, but we'll handle this in data_manager after position is available
+    
     # Air yards and aDOT (average depth of target)
     # Note: aDOT should count ALL targets (completed and incomplete), not just completions
     # air_yards and aDOT already initialized above
@@ -354,59 +356,11 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     else:
         player_features["rushing_touchdowns_ewma"] = np.nan
     
-    # QB-specific features
-    if "passing_yards" in player_features.columns:
-        player_features["qb_rolling_passing_yards_ewma"] = player_groups["passing_yards"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    else:
-        player_features["qb_rolling_passing_yards_ewma"] = 0
+    # NOTE: QB stats are now calculated separately in calculate_qb_stats() function
+    # and merged onto all players by team/game/week. This prevents QB rushing stats
+    # from being confused with player rushing stats.
     
-    if "passing_tds" in player_features.columns:
-        player_features["qb_rolling_passing_TDs_ewma"] = player_groups["passing_tds"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    else:
-        player_features["qb_rolling_passing_TDs_ewma"] = 0
-    
-    if "rushing_yards" in player_features.columns:
-        player_features["qb_rolling_rushing_yards_ewma"] = player_groups["rushing_yards"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    else:
-        player_features["qb_rolling_rushing_yards_ewma"] = 0
-    
-    if "rushing_tds" in player_features.columns:
-        player_features["qb_rolling_rushing_TDs_ewma"] = player_groups["rushing_tds"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    else:
-        player_features["qb_rolling_rushing_TDs_ewma"] = 0
-    
-    # QB rushing attempts (designed rush attempts)
-    # Note: designed_rush_attempts already initialized above
-    
-    if "rusher_player_id" in pbp.columns and "qb_kneel" in pbp.columns:
-        qb_rush_attempts = pbp[
-            (pbp["rush"] == 1) & 
-            (pbp["qb_kneel"] == 0) & 
-            (pbp["rusher_player_id"].notna())
-        ].groupby(["rusher_player_id", "game_id", "season", "week"]).size().reset_index(name="designed_rush_attempts_from_pbp")
-        qb_rush_attempts = qb_rush_attempts.rename(columns={"rusher_player_id": "player_id"})
-        
-        # Merge using a temporary column name to avoid conflicts
-        player_features = pd.merge(
-            player_features,
-            qb_rush_attempts,
-            on=["player_id", "game_id", "season", "week"],
-            how="left"
-        )
-        # Update designed_rush_attempts with merged values
-        if "designed_rush_attempts_from_pbp" in player_features.columns:
-            player_features["designed_rush_attempts"] = player_features["designed_rush_attempts_from_pbp"].fillna(player_features["designed_rush_attempts"])
-            player_features = player_features.drop("designed_rush_attempts_from_pbp", axis=1, errors="ignore")
-        # Don't fillna - preserve NaN for players without designed_rush_attempts
-    
-    # Ensure designed_rush_attempts exists before calculating EWMA
-    if "designed_rush_attempts" not in player_features.columns:
-        player_features["designed_rush_attempts"] = np.nan
-    
-    # Recreate player_groups to ensure it has the latest columns
-    player_groups = player_features.groupby("player_id", group_keys=False)
-    
-    player_features["designed_rush_attempts_ewma"] = player_groups["designed_rush_attempts"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+    # Note: designed_rush_attempts_ewma has been removed from features
     
     # Pass attempts inside 10 (QB stat)
     # Note: pass_attempts_inside10 already initialized above
@@ -562,23 +516,12 @@ def calculate_team_context_features(player_features, pbp, schedules):
     if "air_yards" not in player_features.columns:
         player_features["air_yards"] = 0
     
-    team_air_yards = player_features.groupby(["team", "game_id", "season", "week"])["air_yards"].sum().reset_index(name="team_total_air_yards")
-    team_air_yards = team_air_yards.sort_values(by=["team", "season", "week"])
-    team_air_yards["team_total_air_yards_ewma"] = (
-        team_air_yards.groupby("team")["team_total_air_yards"]
-        .apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
-    )
+    # Note: team_total_air_yards_ewma has been removed from features
     
     # Merge team context
     team_context = pd.merge(
         team_plays[["team", "game_id", "season", "week", "team_play_volume_ewma"]],
         team_rz_touches[["team", "game_id", "season", "week", "team_total_red_zone_touches_ewma"]],
-        on=["team", "game_id", "season", "week"],
-        how="outer"
-    )
-    team_context = pd.merge(
-        team_context,
-        team_air_yards[["team", "game_id", "season", "week", "team_total_air_yards_ewma"]],
         on=["team", "game_id", "season", "week"],
         how="outer"
     )
@@ -638,7 +581,7 @@ def calculate_team_shares(player_features, team_context):
     """
     # Merge team context - ensure required columns exist in team_context
     # Drop any existing columns from player_features to avoid merge conflicts
-    cols_to_drop = ["team_total_red_zone_touches_ewma", "team_total_air_yards_ewma"]
+    cols_to_drop = ["team_total_red_zone_touches_ewma"]
     for col in cols_to_drop:
         if col in player_features.columns:
             player_features = player_features.drop(columns=[col])
@@ -646,8 +589,6 @@ def calculate_team_shares(player_features, team_context):
     required_cols = ["team", "game_id", "season", "week"]
     if "team_total_red_zone_touches_ewma" in team_context.columns:
         required_cols.append("team_total_red_zone_touches_ewma")
-    if "team_total_air_yards_ewma" in team_context.columns:
-        required_cols.append("team_total_air_yards_ewma")
     
     df = pd.merge(
         player_features,
@@ -682,48 +623,7 @@ def calculate_team_shares(player_features, team_context):
     # Set to NaN if player has no red_zone_touches (not 0)
     df.loc[df["red_zone_touches_ewma"].isna() | (df["red_zone_touches_ewma"] == 0), "red_zone_touch_share_ewma"] = np.nan
     
-    # Air yards share (normalized by team passing volume)
-    # Normalize share by team volume to account for low-volume vs high-volume passing teams
-    # Formula: share * (team_volume / league_average) = share * volume_factor
-    # This ensures a 20% share on a high-volume team is recognized as better than 67% on low-volume team
-    
-    # Ensure air_yards_ewma exists
-    if "air_yards_ewma" not in df.columns:
-        df["air_yards_ewma"] = 0
-    if "team_total_air_yards_ewma" not in df.columns:
-        df["team_total_air_yards_ewma"] = 0
-    
-    # Calculate basic share first
-    # Only calculate share for players who actually have air_yards_ewma > 0
-    # For players with 0 air_yards, set share to NaN (will be kept as NaN for position-aware imputation)
-    df["air_yards_share_ewma"] = np.where(
-        df["air_yards_ewma"] > 0,
-        df["air_yards_ewma"] / (df["team_total_air_yards_ewma"] + 1),
-        np.nan  # Use NaN for players with no air_yards (not 0, which could be misinterpreted)
-    )
-    
-    # Calculate league average team air yards per game for normalization baseline
-    # Use median to be robust to outliers, but only on teams with meaningful air yards
-    team_air_yards_nonzero = df[df["team_total_air_yards_ewma"] > 0]["team_total_air_yards_ewma"]
-    if len(team_air_yards_nonzero) > 0:
-        league_avg_team_air_yards = team_air_yards_nonzero.median()
-        if pd.isna(league_avg_team_air_yards) or league_avg_team_air_yards == 0:
-            league_avg_team_air_yards = team_air_yards_nonzero.mean()
-            if pd.isna(league_avg_team_air_yards) or league_avg_team_air_yards == 0:
-                league_avg_team_air_yards = 2750.0
-    else:
-        league_avg_team_air_yards = 2750.0
-    
-    # Normalize the share by team volume (only for players with actual share values)
-    # Share * (team_volume / league_avg) = effective share adjusted for team passing volume
-    volume_factor = df["team_total_air_yards_ewma"] / league_avg_team_air_yards
-    df["air_yards_share_ewma"] = (
-        df["air_yards_share_ewma"] * volume_factor
-    )
-    
-    # For players with no air_yards_ewma (NaN share), keep as NaN so position-aware imputation handles it
-    # This ensures WR/TE with 0 air_yards get NaN (not applicable), while RBs also get NaN (not applicable)
-    # The model will learn that NaN = feature doesn't apply, not that 0 = good
+    # Note: team_total_air_yards_ewma and air_yards_share_ewma have been removed from features
     
     # aDOT share (player aDOT / team aDOT)
     # Ensure aDOT_ewma exists
@@ -830,4 +730,77 @@ def calculate_defensive_features(pbp, schedules):
                            "def_ewma_yards_allowed_per_game", "def_ewma_TDs_allowed_per_game",
                            "def_ewma_red_zone_completion_pct_allowed", "def_ewma_interceptions_per_game",
                            "opponent_red_zone_def_rank"]]
+
+
+def calculate_qb_stats(player_features, position_col=None):
+    """
+    Calculate QB-specific stats (passing and rushing) for QBs only,
+    then these will be merged onto all players on the same team/game/week.
+    
+    Args:
+        player_features: DataFrame with player features (must have passing/rushing stats)
+        position_col: Series or column name indicating player position
+        
+    Returns:
+        DataFrame with QB stats per game (team, game_id, season, week, qb stats)
+        Ready to merge onto all players by team/game/week
+    """
+    from .config import EWMA_ALPHA
+    
+    # Identify QBs - need position column
+    if position_col is None:
+        if "position" in player_features.columns:
+            position_col = player_features["position"]
+        else:
+            # Can't identify QBs, return empty DataFrame
+            print("[Warning] No position column available for QB stats calculation")
+            return pd.DataFrame()
+    
+    # Filter to QBs only
+    qb_mask = position_col == "QB"
+    if not qb_mask.any():
+        print("[Warning] No QBs found in player_features")
+        return pd.DataFrame()
+    
+    qb_features = player_features[qb_mask].copy()
+    
+    # Ensure sorted by player, season, week for proper EWMA calculation
+    qb_features = qb_features.sort_values(by=["player_id", "season", "week"]).reset_index(drop=True)
+    
+    # Group by player_id to calculate EWMA
+    qb_groups = qb_features.groupby("player_id", group_keys=False)
+    
+    # Start with base columns
+    qb_stats = qb_features[["player_id", "season", "week"]].copy()
+    if "game_id" in qb_features.columns:
+        qb_stats["game_id"] = qb_features["game_id"]
+    if "team" in qb_features.columns:
+        qb_stats["team"] = qb_features["team"]
+    
+    # QB passing stats (renamed to remove "rolling")
+    if "passing_yards" in qb_features.columns:
+        qb_stats["qb_passing_yards_ewma"] = qb_groups["passing_yards"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+    else:
+        qb_stats["qb_passing_yards_ewma"] = np.nan
+    
+    if "passing_tds" in qb_features.columns:
+        qb_stats["qb_passing_TDs_ewma"] = qb_groups["passing_tds"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+    else:
+        qb_stats["qb_passing_TDs_ewma"] = np.nan
+    
+    # QB rushing stats (renamed to remove "rolling")
+    if "rushing_yards" in qb_features.columns:
+        qb_stats["qb_rushing_yards_ewma"] = qb_groups["rushing_yards"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+    else:
+        qb_stats["qb_rushing_yards_ewma"] = np.nan
+    
+    if "rushing_tds" in qb_features.columns:
+        qb_stats["qb_rushing_TDs_ewma"] = qb_groups["rushing_tds"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+    else:
+        qb_stats["qb_rushing_TDs_ewma"] = np.nan
+    
+    # Return QB stats with player_id (which is the qb_id) for merging
+    # Merge will be done by qb_id, season, week in data_manager
+    return qb_stats[["player_id", "season", "week", "qb_passing_yards_ewma", "qb_passing_TDs_ewma", 
+                     "qb_rushing_yards_ewma", "qb_rushing_TDs_ewma"]].copy()
 
