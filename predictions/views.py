@@ -16,7 +16,14 @@ import traceback
 
 from .config import FEATURES, NUMERIC_FEATURES
 from .data_manager import NFLDataManager
-from .ml_model import train_model, predict_week, retrain_model, NFLTouchdownModel
+from .ml_model import (
+    train_model,
+    predict_week,
+    retrain_model,
+    NFLTouchdownModel,
+    compare_breakout_feature_sets,
+)
+from .utils import get_sleeper_injury_status_map
 
 
 def json_response_view(func):
@@ -160,6 +167,9 @@ def train_model_view(request):
                 'model_exists': True
             })
         
+        # Compare breakout feature configurations before final training
+        compare_breakout_feature_sets(df.copy(), season, week, FEATURES, NUMERIC_FEATURES)
+        
         # Train model
         success, msg = train_model(df, season, week, FEATURES, NUMERIC_FEATURES)
         
@@ -206,6 +216,9 @@ def retrain_model_view(request):
         
         # Get training data from session
         df = pd.read_json(request.session['training_data'], orient='split')
+        
+        # Compare breakout feature configurations before retraining
+        compare_breakout_feature_sets(df.copy(), season, week, FEATURES, NUMERIC_FEATURES)
         
         # Train model (this will overwrite existing)
         success, msg = train_model(df, season, week, FEATURES, NUMERIC_FEATURES)
@@ -409,6 +422,24 @@ def predict_week_view(request):
                 print(f"[Warning] Keeping all {before_count} players (may include players with no stats)")
                 print(f"[Warning] This might indicate early season (EWMA features may be NaN) or data quality issue")
         
+        # Fetch injury status from Sleeper API and map to current players
+        injury_status_map = get_sleeper_injury_status_map()
+        if 'player_id' in current_week.columns:
+            def _lookup_injury_status(pid):
+                if pd.isna(pid):
+                    return 'Unknown'
+                return injury_status_map.get(str(pid).upper(), 'Unknown')
+            current_week['injury_status'] = current_week['player_id'].apply(_lookup_injury_status)
+        else:
+            current_week['injury_status'] = 'Unknown'
+        
+        if 'report_status' in current_week.columns:
+            current_week['injury_status'] = np.where(
+                current_week['injury_status'].isin([None, 'Unknown']),
+                current_week['report_status'],
+                current_week['injury_status']
+            )
+        
         # Get full training data (all historical weeks) from session
         if 'training_data' in request.session:
             training_data = pd.read_json(request.session['training_data'], orient='split')
@@ -457,7 +488,7 @@ def predict_week_view(request):
         
         # Prepare data for frontend
         display_cols = ['player_name', 'team', 'position', 'against', 'probability', 
-                       'played', 'touchdown', 'report_status', 'season', 'week', 'player_id']
+                       'played', 'touchdown', 'injury_status', 'season', 'week', 'player_id']
         df_display = df_predicted[[col for col in display_cols if col in df_predicted.columns]].copy()
         
         # Convert to dict first, then replace NaN with None for JSON compatibility
@@ -573,9 +604,27 @@ def get_feature_data(request):
             if players_with_stats >= min_players_needed:
                 current_week = current_week[has_stats].copy()
         
+        # Fetch injury status to display in feature table
+        injury_status_map = get_sleeper_injury_status_map()
+        if 'player_id' in current_week.columns:
+            def _lookup_injury_status(pid):
+                if pd.isna(pid):
+                    return 'Unknown'
+                return injury_status_map.get(str(pid).upper(), 'Unknown')
+            current_week['injury_status'] = current_week['player_id'].apply(_lookup_injury_status)
+        else:
+            current_week['injury_status'] = 'Unknown'
+        
+        if 'report_status' in current_week.columns:
+            current_week['injury_status'] = np.where(
+                current_week['injury_status'].isin([None, 'Unknown']),
+                current_week['report_status'],
+                current_week['injury_status']
+            )
+        
         # Select only feature columns + player identifying info
         # This matches exactly what goes into the model (X matrix)
-        display_cols = ['player_id', 'player_name', 'team', 'position', 'against', 'season', 'week']
+        display_cols = ['player_id', 'player_name', 'team', 'position', 'against', 'injury_status', 'season', 'week']
         
         # Get features that exist in current_week (same as what predict_week does)
         available_features = [f for f in FEATURES if f in current_week.columns]

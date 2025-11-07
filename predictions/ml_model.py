@@ -8,7 +8,7 @@ import pandas as pd
 import joblib
 import xgboost as xgb
 import optuna
-from typing import Tuple, Optional
+from typing import Tuple, Optional, List
 import io
 import tempfile
 import json
@@ -29,6 +29,7 @@ from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
     roc_auc_score, roc_curve
 )
+from sklearn.linear_model import LogisticRegression
 
 from .config import REPORT_STATUS_ORDER, MODEL_PARAMS, POSITIONS, CATEGORICAL_FEATURES
 from .models import MLModel
@@ -50,13 +51,19 @@ class NFLTouchdownModel:
         self.scaler_stds = {}  # Store scaling stds for each feature
         self.feature_importance = {}  # Store feature importance scores
         self.feature_names = []  # Store feature names in order
+        self.calibrator_params: Optional[dict] = None  # Platt scaling parameters (coef/intercept)
 
     def model_exists(self) -> bool:
         """Check if model for this season/week exists in database"""
         return MLModel.objects.filter(season=self.season, week=self.week).exists()
 
     def train(
-        self, df: pd.DataFrame, features: list, numeric_features: list
+        self,
+        df: pd.DataFrame,
+        features: list,
+        numeric_features: list,
+        save_model: bool = True,
+        comparison_label: Optional[str] = None,
     ) -> Tuple[bool, str]:
         """
         Train the model on historical data
@@ -73,7 +80,12 @@ class NFLTouchdownModel:
         print(f"Training model for Season {self.season}, Week {self.week}")
         print(f"{'='*60}\n")
 
+        self.calibrator_params = None
+
         try:
+            if comparison_label:
+                print(f"[Comparison] Evaluating feature configuration: {comparison_label}")
+            
             # Validate required columns
             if "player_id" not in df.columns:
                 return (False, "Missing required column: player_id")
@@ -244,7 +256,7 @@ class NFLTouchdownModel:
                 # Store imputation strategy for later use
                 self.imputer = SimpleImputer(strategy="mean")  # Keep for compatibility
                 self.scaler = StandardScaler()
-                
+
                 # Scale the data - StandardScaler can handle NaN (it ignores them during fit, but we need to handle them)
                 # For scaling, we'll use a custom approach that handles NaN
                 for feature in numeric_only_features:
@@ -257,7 +269,7 @@ class NFLTouchdownModel:
                         elif pd.notna(mean_val):
                             # If std is 0 or NaN, just center it
                             X[feature] = X[feature] - mean_val
-                
+
                 # Store scaling parameters for later
                 self.scaler_means = {feat: X[feat].mean() for feat in numeric_only_features if feat in X.columns}
                 self.scaler_stds = {feat: X[feat].std() for feat in numeric_only_features if feat in X.columns}
@@ -282,8 +294,8 @@ class NFLTouchdownModel:
                 # No categorical features, just use passthrough
                 self.encoder = ColumnTransformer(
                     transformers=[],
-                    remainder="passthrough",
-                )
+                remainder="passthrough",
+            )
 
             X_encoded = self.encoder.fit_transform(X)
 
@@ -321,7 +333,7 @@ class NFLTouchdownModel:
             
             # Replace NaN with sentinel value before SMOTE
             X_train_np = np.where(np.isnan(X_train_np), NAN_SENTINEL, X_train_np)
-            
+
             # Apply SMOTE
             print("[Training] Applying SMOTE for class balancing...")
             smote = SMOTE(random_state=MODEL_PARAMS["random_state"])
@@ -446,12 +458,24 @@ class NFLTouchdownModel:
                 verbose_eval=10,  # Print every 10 rounds
             )
             
-            # Optimize prediction threshold based on validation set
+            # Generate raw predictions for calibration/evaluation
+            y_val_pred_prob_raw = self.model.predict(dval)
+            y_test_pred_prob_raw = self.model.predict(dtest)
+            train_pred_prob_raw = self.model.predict(dtrain)
+
+            # Fit Platt scaling (calibration) on validation predictions if enabled
+            self._fit_platt_scaler(y_val_pred_prob_raw, y_val)
+
+            # Apply calibration (no-op if calibrator is None)
+            y_val_pred_prob = self._apply_platt_scaling(y_val_pred_prob_raw)
+            y_test_pred_prob = self._apply_platt_scaling(y_test_pred_prob_raw)
+            train_pred_prob = self._apply_platt_scaling(train_pred_prob_raw)
+
+            # Optimize prediction threshold based on calibrated validation probabilities
             if MODEL_PARAMS.get("optimize_threshold", False):
                 print("[Training] Optimizing prediction threshold...")
-                y_val_pred_prob = self.model.predict(dval)
                 fpr, tpr, thresholds = roc_curve(y_val, y_val_pred_prob)
-                
+
                 # Find threshold that maximizes F1 score
                 best_f1 = 0
                 best_threshold = MODEL_PARAMS["prediction_threshold"]
@@ -461,21 +485,19 @@ class NFLTouchdownModel:
                     if f1 > best_f1:
                         best_f1 = f1
                         best_threshold = threshold
-                
+
                 print(f"[Training] Optimized threshold: {best_threshold:.4f} (F1: {best_f1:.4f})")
                 self.optimal_threshold = best_threshold
             else:
                 self.optimal_threshold = MODEL_PARAMS["prediction_threshold"]
 
-            # Evaluate on test set
+            # Evaluate on test set using calibrated probabilities
             print("\n[Evaluation] Evaluating model on test set...")
-            y_test_pred_prob = self.model.predict(dtest)
             y_test_pred_binary = (y_test_pred_prob >= self.optimal_threshold).astype(int)
-            
+
             # Also evaluate on validation set for comparison
-            y_val_pred_prob = self.model.predict(dval)
             y_val_pred_binary = (y_val_pred_prob >= self.optimal_threshold).astype(int)
-            
+
             # Calculate comprehensive metrics
             test_accuracy = accuracy_score(y_test, y_test_pred_binary)
             test_precision = precision_score(y_test, y_test_pred_binary, zero_division=0)
@@ -483,16 +505,15 @@ class NFLTouchdownModel:
             test_f1 = f1_score(y_test, y_test_pred_binary)
             test_logloss = log_loss(y_test, y_test_pred_prob)
             test_auc = roc_auc_score(y_test, y_test_pred_prob)
-            
+
             val_accuracy = accuracy_score(y_val, y_val_pred_binary)
             val_precision = precision_score(y_val, y_val_pred_binary, zero_division=0)
             val_recall = recall_score(y_val, y_val_pred_binary)
             val_f1 = f1_score(y_val, y_val_pred_binary)
             val_logloss = log_loss(y_val, y_val_pred_prob)
             val_auc = roc_auc_score(y_val, y_val_pred_prob)
-            
+
             # Check for overfitting (difference between train and validation)
-            train_pred_prob = self.model.predict(dtrain)
             train_logloss = log_loss(y_train_resampled, train_pred_prob)
             train_accuracy = accuracy_score(y_train_resampled, (train_pred_prob >= self.optimal_threshold).astype(int))
             
@@ -563,6 +584,11 @@ class NFLTouchdownModel:
             encoder_bytes = encoder_buffer.getvalue()
             
             # Save or update in database
+            features_with_missing_payload = {
+                "features_with_missing": self.features_with_missing,
+                "calibrator": self.calibrator_params,
+            }
+
             ml_model, created = MLModel.objects.update_or_create(
                 season=self.season,
                 week=self.week,
@@ -571,7 +597,7 @@ class NFLTouchdownModel:
                     'imputer_file': imputer_bytes,
                     'scaler_file': scaler_bytes,
                     'encoder_file': encoder_bytes,
-                    'features_with_missing': json.dumps(self.features_with_missing),
+                    'features_with_missing': json.dumps(features_with_missing_payload),
                     'scaler_means': json.dumps(self.scaler_means),
                     'scaler_stds': json.dumps(self.scaler_stds),
                     'feature_importance': json.dumps(self.feature_importance),
@@ -584,10 +610,13 @@ class NFLTouchdownModel:
                 }
             )
 
-            print(f"\n[Success] Model saved to database for Season {self.season}, Week {self.week}")
-            
-            # Export feature importance to CSV for analysis
-            self._export_feature_importance()
+            if save_model:
+                print(f"\n[Success] Model saved to database for Season {self.season}, Week {self.week}")
+                
+                # Export feature importance to CSV for analysis
+                self._export_feature_importance()
+            else:
+                print(f"\n[Info] Comparison run '{comparison_label or 'unspecified'}' completed (model not saved)")
             
             return (
                 True,
@@ -611,7 +640,7 @@ class NFLTouchdownModel:
             with tempfile.NamedTemporaryFile(delete=False, suffix='.json', mode='wb') as tmp_model:
                 tmp_model_path = tmp_model.name
                 tmp_model.write(ml_model.model_file)
-            
+
             self.model = xgb.Booster()
             self.model.load_model(tmp_model_path)
             os.unlink(tmp_model_path)  # Clean up temp file
@@ -627,10 +656,19 @@ class NFLTouchdownModel:
             self.encoder = joblib.load(encoder_buffer)
             
             # Load position-aware imputation/scaling parameters if available
+            self.features_with_missing = []
+            self.calibrator_params = None
             if hasattr(ml_model, 'features_with_missing') and ml_model.features_with_missing:
-                self.features_with_missing = json.loads(ml_model.features_with_missing)
-            else:
-                self.features_with_missing = []
+                try:
+                    payload = json.loads(ml_model.features_with_missing)
+                    if isinstance(payload, dict):
+                        self.features_with_missing = payload.get("features_with_missing", [])
+                        self.calibrator_params = payload.get("calibrator")
+                    else:
+                        self.features_with_missing = payload
+                except json.JSONDecodeError:
+                    self.features_with_missing = []
+                    self.calibrator_params = None
             
             if hasattr(ml_model, 'scaler_means') and ml_model.scaler_means:
                 self.scaler_means = json.loads(ml_model.scaler_means)
@@ -668,6 +706,44 @@ class NFLTouchdownModel:
             print(f"[Error] Failed to load model: {str(e)}")
             return False
     
+    def _fit_platt_scaler(self, val_probs: np.ndarray, val_labels: np.ndarray) -> None:
+        """Fit Platt scaling (logistic regression) on validation predictions."""
+        self.calibrator_params = None
+
+        if not MODEL_PARAMS.get("enable_platt_scaling", False):
+            return
+
+        val_probs = np.asarray(val_probs, dtype=np.float64)
+        val_labels = np.asarray(val_labels)
+
+        if len(np.unique(val_labels)) < 2:
+            print("[Calibration] Skipping Platt scaling (validation set needs both classes)")
+            return
+
+        try:
+            calibrator = LogisticRegression(solver="lbfgs", class_weight="balanced")
+            calibrator.fit(val_probs.reshape(-1, 1), val_labels)
+
+            coef = float(calibrator.coef_.ravel()[0])
+            intercept = float(calibrator.intercept_[0])
+            self.calibrator_params = {"coef": coef, "intercept": intercept}
+            print(f"[Calibration] Platt scaling fitted (coef={coef:.4f}, intercept={intercept:.4f})")
+        except Exception as exc:
+            print(f"[Calibration] Warning: Failed to fit Platt scaler ({exc}). Using raw probabilities.")
+            self.calibrator_params = None
+
+    def _apply_platt_scaling(self, probs: np.ndarray) -> np.ndarray:
+        """Apply Platt scaling to probability predictions, if available."""
+        if not self.calibrator_params:
+            return probs
+
+        probs = np.asarray(probs, dtype=np.float64)
+        coef = float(self.calibrator_params.get("coef", 0.0))
+        intercept = float(self.calibrator_params.get("intercept", 0.0))
+        logits = np.clip(coef * probs + intercept, -50, 50)
+        calibrated = 1.0 / (1.0 + np.exp(-logits))
+        return calibrated
+
     def _calculate_feature_importance(self, X_encoded, feature_names):
         """Calculate feature importance using multiple methods"""
         try:
@@ -878,7 +954,7 @@ class NFLTouchdownModel:
             X = current_week[["player_id"] + features_to_select].copy()
             player_ids = X["player_id"].values
             X = X.drop("player_id", axis=1)
-            
+
             # Store position column for imputation, then remove from X if it's not a feature
             position_col_for_imputation = None
             if "position" in X.columns and "position" not in available_features:
@@ -996,6 +1072,7 @@ class NFLTouchdownModel:
             # Predict
             dnew = xgb.DMatrix(X_encoded)
             y_pred_prob = self.model.predict(dnew)
+            y_pred_prob = self._apply_platt_scaling(y_pred_prob)
 
             # Calculate SHAP values for feature explanations
             shap_values = None
@@ -1055,6 +1132,7 @@ class NFLTouchdownModel:
                         "team",
                         "against",
                         "report_status",
+                        "injury_status",
                         "played",
                         "position",
                     ]
@@ -1141,3 +1219,76 @@ def retrain_model(
         )
 
     return model.train(df, features, numeric_features)
+
+
+def compare_breakout_feature_sets(
+    df: pd.DataFrame,
+    season: int,
+    week: int,
+    combined_features: List[str],
+    combined_numeric_features: List[str],
+) -> None:
+    """
+    Compare model performance between combined vs. split breakout feature sets.
+
+    Prints evaluation summaries to the console for both configurations.
+    """
+    required_split_features = [
+        "recent_rushing_td_breakout",
+        "recent_receiving_td_breakout",
+        "recent_rushing_yards_breakout",
+        "recent_receiving_yards_breakout",
+    ]
+
+    missing_split = [feat for feat in required_split_features if feat not in df.columns]
+    if missing_split:
+        print(f"[Comparison] Skipping breakout feature comparison. Missing columns: {missing_split}")
+        return
+
+    combined_feature_list = combined_features
+    combined_numeric_list = combined_numeric_features
+
+    # Build split feature lists by replacing combined breakout features
+    split_features: List[str] = []
+    split_numeric_features: List[str] = []
+
+    for feat in combined_features:
+        if feat == "recent_total_breakout_tds_position_normalized":
+            split_features.extend(["recent_rushing_td_breakout", "recent_receiving_td_breakout"])
+        elif feat == "recent_total_breakout_yards_position_normalized":
+            split_features.extend(["recent_rushing_yards_breakout", "recent_receiving_yards_breakout"])
+        else:
+            split_features.append(feat)
+
+    for feat in combined_numeric_features:
+        if feat == "recent_total_breakout_tds_position_normalized":
+            split_numeric_features.extend(["recent_rushing_td_breakout", "recent_receiving_td_breakout"])
+        elif feat == "recent_total_breakout_yards_position_normalized":
+            split_numeric_features.extend(["recent_rushing_yards_breakout", "recent_receiving_yards_breakout"])
+        else:
+            split_numeric_features.append(feat)
+
+    print("\n" + "=" * 80)
+    print("BREAKOUT FEATURE COMPARISON")
+    print("=" * 80)
+
+    scenarios = [
+        ("Combined Breakout Features", combined_feature_list, combined_numeric_list),
+        ("Split Breakout Features", split_features, split_numeric_features),
+    ]
+
+    for label, feats, num_feats in scenarios:
+        print("\n" + "-" * 80)
+        print(f"[Comparison] Scenario: {label}")
+        print("-" * 80)
+
+        model = NFLTouchdownModel(season, week)
+        success, message = model.train(df.copy(), feats, num_feats, save_model=False, comparison_label=label)
+        if not success:
+            print(f"[Comparison] {label} failed: {message}")
+        else:
+            print(f"[Comparison] Completed evaluation for '{label}'. See metrics above.")
+
+    print("\n" + "=" * 80)
+    print("END BREAKOUT FEATURE COMPARISON")
+    print("=" * 80 + "\n")

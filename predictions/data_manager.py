@@ -710,7 +710,7 @@ class NFLDataManager:
             how="left"
         )
         print(f"[Debug] Added team and position columns to player_features_df")
-        
+
         # Red zone touches covers both targets and carries for all positions
         
         # Set position-inapplicable stats to NaN (not 0) to indicate feature doesn't apply
@@ -810,7 +810,7 @@ class NFLDataManager:
         merge_cols = ["player_id", "season", "week"]
         if "game_id" in player_features_df.columns:
             merge_cols.append("game_id")
-        
+
         df = pd.merge(
             df,
             player_features_clean,
@@ -827,7 +827,7 @@ class NFLDataManager:
             df = df.drop(columns=feat_cols)
         
         print(f"[Debug] df after player features merge: {len(df)} records")
-        
+
         # Calculate team context features
         print(f"[Debug] Calculating team context features...")
         team_context = calculate_team_context_features(player_features_df, pbp, schedules)
@@ -859,7 +859,7 @@ class NFLDataManager:
                         df = df.rename(columns={col: base_col})
         
         print(f"[Debug] df after team context merge: {len(df)} records")
-        
+
         # Calculate team shares
         print(f"[Debug] Calculating team shares...")
         df = calculate_team_shares(df, team_context)
@@ -913,7 +913,7 @@ class NFLDataManager:
                 sample_normalized = df[df["touches_ewma_position_normalized"].notna()].groupby("position")["touches_ewma_position_normalized"].describe()
                 print(f"[Debug] Position-normalized touches_ewma stats by position:")
                 print(sample_normalized)
-        
+
         # Calculate position-normalized red_zone_touches_ewma to remove RB/QB bias
         # Normalize red_zone_touches_ewma by position average (WRs/TEs naturally have fewer red zone touches than RBs)
         if "red_zone_touches_ewma" in df.columns and "position" in df.columns:
@@ -1031,6 +1031,62 @@ class NFLDataManager:
                 sample_total_tds = df[df["total_touchdowns_ewma"].notna()].groupby("position")["total_touchdowns_ewma"].describe()
                 print(f"[Debug] Total touchdowns (receiving + rushing) stats by position:")
                 print(sample_total_tds)
+        
+        # Normalize all player usage and performance features by position to remove position bias
+        # This scales features relative to position average (e.g., high-usage WR comparable to high-usage RB)
+        # Must happen AFTER total_yards_ewma and total_touchdowns_ewma are calculated
+        print(f"[Debug] Normalizing player usage and performance features by position...")
+        
+        # Features to normalize by position (player usage and performance metrics)
+        features_to_normalize = [
+            "targets_ewma",
+            "total_yards_ewma",
+            "total_touchdowns_ewma",
+            "reception_rate_ewma",
+            "red_zone_touch_share_ewma",
+            "recent_total_breakout_tds",
+            "recent_total_breakout_yards",
+        ]
+        
+        # Normalize each feature by position average
+        for feature in features_to_normalize:
+            if feature in df.columns and "position" in df.columns:
+                print(f"[Debug] Normalizing {feature} by position...")
+                
+                # Calculate position average for this feature (grouped by position, season, week)
+                position_avg = df.groupby(["position", "season", "week"])[feature].mean().reset_index()
+                position_avg = position_avg.rename(columns={feature: f"position_avg_{feature}"})
+                
+                # Merge position averages back
+                df = pd.merge(
+                    df,
+                    position_avg,
+                    on=["position", "season", "week"],
+                    how="left"
+                )
+                
+                # Calculate normalized value: player_value / position_avg
+                normalized_feature = f"{feature}_position_normalized"
+                min_avg = 0.1 if "td" in feature.lower() else 1.0  # Lower threshold for TD features
+                df[normalized_feature] = (
+                    df[feature] / (df[f"position_avg_{feature}"].clip(lower=min_avg))
+                )
+                
+                # Set to NaN if original was NaN
+                df.loc[df[feature].isna(), normalized_feature] = np.nan
+                
+                # Cap at reasonable maximum (5x average) to prevent extreme values
+                max_normalized = 5.0
+                df.loc[df[normalized_feature] > max_normalized, normalized_feature] = max_normalized
+                
+                # Drop intermediate column
+                df = df.drop(columns=[f"position_avg_{feature}"])
+                
+                # Debug: Show sample of normalized values
+                if len(df) > 0:
+                    sample_normalized = df[df[normalized_feature].notna()].groupby("position")[normalized_feature].describe()
+                    print(f"[Debug] Position-normalized {feature} stats by position:")
+                    print(sample_normalized)
         
         # Rename 'home' to 'is_home' for consistency with feature blueprint
         if "home" in df.columns:

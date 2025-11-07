@@ -23,19 +23,30 @@ except (ImportError, AttributeError, RuntimeError):
 
 # Feature Configuration - Complete Feature Overhaul
 FEATURES = [
-    # Player Usage & Performance Metrics (EWMA)
-    "targets_ewma", # player_stats - total targets (applies to all positions)
+    # Player Usage & Performance Metrics (EWMA) - All normalized by position to remove bias
+    # Removed: "targets_ewma" - use position-normalized version
+    "targets_ewma_position_normalized",  # targets normalized by position average
     # Removed: "receptions_ewma" - use reception_rate_ewma instead (more meaningful)
     # Removed: "carries_ewma" - doesn't apply to WR/TE, use targets_ewma for receiving usage instead
-    "reception_rate_ewma",  # receptions / targets (reliability metric - high = good hands, low = drops)
+    # Removed: "reception_rate_ewma" - use position-normalized version
+    "reception_rate_ewma_position_normalized",  # reception rate normalized by position average
     # Removed: "touches_ewma" - too RB/QB heavy, use position-specific features instead
     "touches_ewma_position_normalized",  # touches_ewma normalized by position average (removes position bias)
     # Combined yards and touchdowns (position-agnostic - works for all positions)
-    "total_yards_ewma",  # receiving_yards_ewma + rushing_yards_ewma (total production)
-    "total_touchdowns_ewma",  # receiving_touchdowns_ewma + rushing_touchdowns_ewma (total production)
+    # Removed: "total_yards_ewma" - use position-normalized version
+    "total_yards_ewma_position_normalized",  # total yards normalized by position average
+    # Removed: "total_touchdowns_ewma" - use position-normalized version
+    "total_touchdowns_ewma_position_normalized",  # total touchdowns normalized by position average
     # Removed: "red_zone_touches_ewma" - too RB/QB heavy, use position-normalized version
     "red_zone_touches_ewma_position_normalized",  # red_zone_touches_ewma normalized by position average
-    "red_zone_touch_share_ewma",
+    # Removed: "red_zone_touch_share_ewma" - use position-normalized version
+    "red_zone_touch_share_ewma_position_normalized",
+    
+    # Breakout Game Indicators (capture recent surge in performance) - Position-normalized
+    # Based on total touchdowns and total yards (position-agnostic)
+    "recent_total_breakout_tds_position_normalized",  # Total TDs breakout normalized by position
+    "recent_total_breakout_yards_position_normalized",  # Total yards breakout normalized by position
+    "recent_breakout_game",  # 1 if any breakout occurred in last game
     
     # Team Context (EWMA)
     "team_play_volume_ewma",
@@ -62,25 +73,29 @@ FEATURES = [
 ]
 
 NUMERIC_FEATURES = [
-    # Player Usage & Performance Metrics (EWMA)
-    "targets_ewma",  # total targets (applies to all positions)
+    # Player Usage & Performance Metrics (EWMA) - All normalized by position to remove bias
+    # Removed: "targets_ewma" - use position-normalized version
+    "targets_ewma_position_normalized",
     # Removed: "receptions_ewma" - use reception_rate_ewma instead (more meaningful)
     # Removed: "carries_ewma" - doesn't apply to WR/TE, use targets_ewma for receiving usage instead
-    "reception_rate_ewma",  # receptions / targets (reliability metric)
+    # Removed: "reception_rate_ewma" - use position-normalized version
+    "reception_rate_ewma_position_normalized",
     # Removed: "touches_ewma" - too RB/QB heavy, use position-specific features instead
     "touches_ewma_position_normalized",
     # Combined yards and touchdowns (position-agnostic - works for all positions)
-    "total_yards_ewma",  # receiving_yards_ewma + rushing_yards_ewma
-    "total_touchdowns_ewma",  # receiving_touchdowns_ewma + rushing_touchdowns_ewma
+    # Removed: "total_yards_ewma" - use position-normalized version
+    "total_yards_ewma_position_normalized",
+    # Removed: "total_touchdowns_ewma" - use position-normalized version
+    "total_touchdowns_ewma_position_normalized",
     # Removed: "red_zone_touches_ewma" - too RB/QB heavy, use position-normalized version
     "red_zone_touches_ewma_position_normalized",
-    "red_zone_touch_share_ewma",
+    # Removed: "red_zone_touch_share_ewma" - use position-normalized version
+    "red_zone_touch_share_ewma_position_normalized",
     
-    # Breakout Game Indicators (capture recent surge in performance)
-    "recent_rushing_td_breakout",  # 1 if last game had >= 2 rushing TDs
-    "recent_receiving_td_breakout",  # 1 if last game had >= 2 receiving TDs
-    "recent_rushing_yards_breakout",  # 1 if last game had >= 150 rushing yards
-    "recent_receiving_yards_breakout",  # 1 if last game had >= 150 receiving yards
+    # Breakout Game Indicators (capture recent surge in performance) - Position-normalized
+    # Based on total touchdowns and total yards (position-agnostic)
+    "recent_total_breakout_tds_position_normalized",  # Total TDs breakout normalized by position
+    "recent_total_breakout_yards_position_normalized",  # Total yards breakout normalized by position
     "recent_breakout_game",  # 1 if any breakout occurred in last game
     
     # Team Context (EWMA)
@@ -129,6 +144,7 @@ MODEL_PARAMS = {
     "num_boost_round": 500,  # Increased max rounds (early stopping will prevent overfitting)
     "early_stopping_rounds": 50,  # Increased to 50 for more aggressive early stopping
     "early_stopping_patience": 50,  # Same as early_stopping_rounds for clarity
+    "enable_platt_scaling": True,  # Calibrate probabilities with Platt scaling
     
     # Feature Selection
     "min_feature_importance": 0.01,  # Minimum SHAP importance to keep feature (0.01 = 1%)
@@ -163,10 +179,8 @@ WINSORIZE_PERCENTILE = 0.95  # Cap values at 95th percentile (0.95 = cap at 95th
 # Breakout Detection Configuration
 # Flags recent breakout games separately so model can learn from them
 BREAKOUT_ENABLED = True  # Enable breakout game indicators
-BREAKOUT_RUSHING_TDS = 2  # Minimum rushing TDs in a game to count as breakout
-BREAKOUT_RECEIVING_TDS = 2  # Minimum receiving TDs in a game to count as breakout
-BREAKOUT_RUSHING_YARDS = 150  # Minimum rushing yards in a game to count as breakout
-BREAKOUT_RECEIVING_YARDS = 150  # Minimum receiving yards in a game to count as breakout
+BREAKOUT_TOTAL_TDS = 2  # Minimum total TDs (receiving + rushing) in a game to count as breakout
+BREAKOUT_TOTAL_YARDS = 150  # Minimum total yards (receiving + rushing) in a game to count as breakout
 # Data Loading Configuration
 HISTORICAL_SEASONS = 2  # Number of previous seasons to use for training (season - 2, so for 2025 use 2023, 2024)
 MAX_WEEK = 20

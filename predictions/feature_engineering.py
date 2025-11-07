@@ -233,57 +233,60 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
         player_features["rushing_touchdowns_ewma"] = np.nan
     
     # Add breakout game indicators (captures recent surge in performance)
-    # These are separate from EWMA to help model learn from breakout games
+    # Includes both split (rushing/receiving) and combined totals for comparison
+    # Combined totals will be normalized by position later in data_manager
     from .config import BREAKOUT_ENABLED
     if BREAKOUT_ENABLED:
-        from .config import (
-            BREAKOUT_RUSHING_TDS, BREAKOUT_RECEIVING_TDS,
-            BREAKOUT_RUSHING_YARDS, BREAKOUT_RECEIVING_YARDS
-        )
+        from .config import BREAKOUT_TOTAL_TDS, BREAKOUT_TOTAL_YARDS
         
         # Sort by player, season, week to identify "last game"
         player_features = player_features.sort_values(by=["player_id", "season", "week"]).reset_index(drop=True)
+        player_groups = player_features.groupby("player_id", group_keys=False)
         
-        # Rushing TD breakout: 1 if last game had >= BREAKOUT_RUSHING_TDS rushing TDs
-        if "rushing_tds" in player_features.columns:
-            player_features["recent_rushing_td_breakout"] = player_groups["rushing_tds"].apply(
-                lambda x: (x.shift(1) >= BREAKOUT_RUSHING_TDS).astype(int)
+        # Calculate total touchdowns and total yards for combined breakout detection
+        if "receiving_tds" in player_features.columns and "rushing_tds" in player_features.columns:
+            player_features["total_tds"] = (
+                player_features["receiving_tds"].fillna(0) + player_features["rushing_tds"].fillna(0)
             )
+        elif "receiving_tds" in player_features.columns:
+            player_features["total_tds"] = player_features["receiving_tds"].fillna(0)
+        elif "rushing_tds" in player_features.columns:
+            player_features["total_tds"] = player_features["rushing_tds"].fillna(0)
         else:
-            player_features["recent_rushing_td_breakout"] = 0
+            player_features["total_tds"] = 0
         
-        # Receiving TD breakout: 1 if last game had >= BREAKOUT_RECEIVING_TDS receiving TDs
-        if "receiving_tds" in player_features.columns:
-            player_features["recent_receiving_td_breakout"] = player_groups["receiving_tds"].apply(
-                lambda x: (x.shift(1) >= BREAKOUT_RECEIVING_TDS).astype(int)
+        if "receiving_yards" in player_features.columns and "rushing_yards" in player_features.columns:
+            player_features["total_yards"] = (
+                player_features["receiving_yards"].fillna(0) + player_features["rushing_yards"].fillna(0)
             )
+        elif "receiving_yards" in player_features.columns:
+            player_features["total_yards"] = player_features["receiving_yards"].fillna(0)
+        elif "rushing_yards" in player_features.columns:
+            player_features["total_yards"] = player_features["rushing_yards"].fillna(0)
         else:
-            player_features["recent_receiving_td_breakout"] = 0
+            player_features["total_yards"] = 0
         
-        # Rushing yards breakout: 1 if last game had >= BREAKOUT_RUSHING_YARDS rushing yards
-        if "rushing_yards" in player_features.columns:
-            player_features["recent_rushing_yards_breakout"] = player_groups["rushing_yards"].apply(
-                lambda x: (x.shift(1) >= BREAKOUT_RUSHING_YARDS).astype(int)
-            )
-        else:
-            player_features["recent_rushing_yards_breakout"] = 0
+        # Recreate player_groups after adding total columns
+        player_groups = player_features.groupby("player_id", group_keys=False)
         
-        # Receiving yards breakout: 1 if last game had >= BREAKOUT_RECEIVING_YARDS receiving yards
-        if "receiving_yards" in player_features.columns:
-            player_features["recent_receiving_yards_breakout"] = player_groups["receiving_yards"].apply(
-                lambda x: (x.shift(1) >= BREAKOUT_RECEIVING_YARDS).astype(int)
-            )
-        else:
-            player_features["recent_receiving_yards_breakout"] = 0
+        # Total TD breakout (raw value, to be normalized later)
+        player_features["recent_total_breakout_tds"] = player_groups["total_tds"].apply(
+            lambda x: x.shift(1).where(x.shift(1) >= BREAKOUT_TOTAL_TDS, 0)
+        )
+        
+        # Total yards breakout (raw value, to be normalized later)
+        player_features["recent_total_breakout_yards"] = player_groups["total_yards"].apply(
+            lambda x: x.shift(1).where(x.shift(1) >= BREAKOUT_TOTAL_YARDS, 0)
+        )
         
         # Combined breakout indicator: 1 if any breakout occurred in last game
-        breakout_cols = [
-            "recent_rushing_td_breakout", "recent_receiving_td_breakout",
-            "recent_rushing_yards_breakout", "recent_receiving_yards_breakout"
-        ]
         player_features["recent_breakout_game"] = (
-            player_features[breakout_cols].sum(axis=1) > 0
+            (player_features["recent_total_breakout_tds"] > 0) | 
+            (player_features["recent_total_breakout_yards"] > 0)
         ).astype(int)
+        
+        # Clean up temporary columns
+        player_features = player_features.drop(columns=["total_tds", "total_yards"], errors="ignore")
     
     return player_features
 
