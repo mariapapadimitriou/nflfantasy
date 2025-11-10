@@ -1,8 +1,10 @@
-import pandas as pd
-import numpy as np
+import logging
 import requests
 from datetime import datetime, timedelta
 from typing import Dict
+
+
+logger = logging.getLogger(__name__)
 
 
 SLEEPER_PLAYERS_URL = "https://api.sleeper.app/v1/players/nfl"
@@ -11,21 +13,6 @@ _sleeper_injury_cache = {
     "timestamp": None,
     "data": {}
 }
-
-
-def match_teams(team, abbr_list):
-    # Try direct match
-    if team in abbr_list.values:
-        return team
-    # Try lower-case match
-    for abbr in abbr_list:
-        if team.lower() == abbr.lower():
-            return abbr
-    # Try partial match
-    for abbr in abbr_list:
-        if team.lower() in abbr.lower():
-            return abbr
-    return team
 
 
 def american_odds_to_probability(odds):
@@ -63,8 +50,7 @@ def get_sleeper_injury_status_map(force_refresh: bool = False) -> Dict[str, str]
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        # Log warning and fall back to cached data if available
-        print(f"[Warning] Unable to fetch Sleeper injury data: {exc}")
+        logger.warning("Unable to fetch Sleeper injury data: %s", exc)
         return _sleeper_injury_cache.get("data", {})
 
     injury_map: Dict[str, str] = {}

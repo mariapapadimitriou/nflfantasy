@@ -9,12 +9,8 @@ import os
 from typing import Dict, Tuple
 from datetime import datetime
 from django.db.models import Q
-
-# Add this to the TOP of data_manager.py after the imports
-
 import logging
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
 logger = logging.getLogger(__name__)
 
 from .config import (
@@ -57,7 +53,7 @@ class NFLDataManager:
             
             records = list(query.values())
             if records:
-                print(f"[Cache] Loading {len(records)} historical records from database")
+                logger.info("Cache: loading %s historical records from database", len(records))
                 df = pd.DataFrame(records)
                 # Reconstruct features from JSON field
                 if 'features' in df.columns and len(df) > 0:
@@ -71,7 +67,7 @@ class NFLDataManager:
                 self.historical_data = df
                 return df
         except Exception as e:
-            print(f"[Cache] Error loading from database: {str(e)}")
+            logger.warning("Cache: error loading from database: %s", e)
         
         return None
 
@@ -81,7 +77,7 @@ class NFLDataManager:
             return
         
         try:
-            print(f"[Cache] Saving historical data to database...")
+            logger.info("Cache: saving historical data to database")
             
             # Prepare data for bulk insert
             training_records = []
@@ -117,13 +113,11 @@ class NFLDataManager:
                 
                 # Bulk insert
                 TrainingData.objects.bulk_create(training_records, ignore_conflicts=True)
-                print(f"[Cache] Saved {len(training_records)} records to database")
+                logger.info("Cache: saved %s records to database", len(training_records))
             
             self.historical_data = df
         except Exception as e:
-            print(f"[Cache] Error saving to database: {str(e)}")
-            import traceback
-            traceback.print_exc()
+            logger.exception("Cache: error saving to database: %s", e)
 
     def get_seasons_to_load(self, season: int, week: int) -> list:
         """Determine which seasons need to be loaded
@@ -147,9 +141,7 @@ class NFLDataManager:
         Returns:
             Dictionary with 'df' (historical) and 'current_week' dataframes
         """
-        print(f"\n{'='*60}")
-        print(f"Loading data for Season {season}, Week {week}")
-        print(f"{'='*60}\n")
+        logger.info("Loading data for season %s, week %s", season, week)
 
         # Load historical data from database if available
         if not force_reload:
@@ -164,8 +156,10 @@ class NFLDataManager:
                 if max_cached_season > season or (
                     max_cached_season == season and max_cached_week >= week - 1
                 ):
-                    print(
-                        f"[Cache] Using cached data up to Season {max_cached_season}, Week {max_cached_week}"
+                    logger.info(
+                        "Cache hit: using data up to season %s, week %s",
+                        max_cached_season,
+                        max_cached_week,
                     )
                     # Filter to appropriate cutoff
                     ref_week = week - 1 if week > 1 else 20
@@ -185,33 +179,33 @@ class NFLDataManager:
                     }
 
         # Load fresh data
-        print("[Loading] Fetching fresh data from source...")
+        logger.info("Loading fresh data from source")
         return self._load_fresh_data(season, week)
 
     def _load_current_week(self, season: int, week: int) -> pd.DataFrame:
         """Load only the current week's data"""
-        print(f"[Loading] Current week data for Season {season}, Week {week}")
+        logger.info("Loading current week data for season %s, week %s", season, week)
 
         try:
             # Load minimal data for current week
             seasons = [season]
             player_stats = self.data_source.load_player_stats(seasons)
-            print(f"[Debug] Loaded {len(player_stats)} player stat records")
+            logger.debug("Loaded %s player stat records", len(player_stats))
 
             pbp = self.data_source.load_pbp(seasons)
-            print(f"[Debug] Loaded {len(pbp)} play-by-play records")
+            logger.debug("Loaded %s play-by-play records", len(pbp))
 
             roster = self.data_source.load_rosters(seasons)
-            print(f"[Debug] Loaded {len(roster)} roster records")
+            logger.debug("Loaded %s roster records", len(roster))
 
             schedules = self.data_source.load_schedules(seasons)
-            print(f"[Debug] Loaded {len(schedules)} schedule records")
+            logger.debug("Loaded %s schedule records", len(schedules))
 
             # Filter to current week
             schedules = schedules[
                 (schedules["season"] == season) & (schedules["week"] == week)
             ]
-            print(f"[Debug] Filtered to {len(schedules)} games for week {week}")
+            logger.debug("Filtered to %s games for week %s", len(schedules), week)
 
             if len(schedules) == 0:
                 raise ValueError(
@@ -220,7 +214,7 @@ class NFLDataManager:
 
 
             # Process current week
-            print(f"[Debug] Processing current week data...")
+            logger.debug("Processing current week data")
             current_week = self._process_data(
                 player_stats,
                 pbp,
@@ -231,17 +225,17 @@ class NFLDataManager:
                 current_week_only=True,
             )
 
-            print(f"[Debug] Current week processed: {len(current_week)} players")
+            logger.debug("Current week processed: %s players", len(current_week))
             return current_week
 
         except Exception as e:
-            print(f"[ERROR] Failed to load current week: {str(e)}")
+            logger.error("Failed to load current week: %s", e)
             raise
 
     def _load_fresh_data(self, season: int, week: int) -> Dict[str, pd.DataFrame]:
         """Load fresh data from source and process"""
         seasons = self.get_seasons_to_load(season, week)
-        print(f"[Loading] Seasons: {seasons}")
+        logger.info("Loading seasons %s", seasons)
 
         # Load all data
         player_stats = self.data_source.load_player_stats(seasons)
@@ -251,7 +245,7 @@ class NFLDataManager:
         team_names = self.data_source.load_teams()
         # injuries = self.data_source.load_injuries()
 
-        # print(injuries.head())
+        # injuries = self.data_source.load_injuries()
 
 
         # Filter schedules
@@ -263,16 +257,14 @@ class NFLDataManager:
             )
         ]
 
-        print(f"[Processing] Filtered schedules: {len(schedules)} games")
-
         # Process data
         df = self._process_data(player_stats, pbp, roster, schedules, season, week)
 
-        print(f"[Processing] Processed data: {len(df)} total records")
+        logger.info("Processed data: %s total records", len(df))
 
         # Split into historical and current week
         current_week = df[(df["season"] == season) & (df["week"] == week)].copy()
-        print(f"[Processing] Current week: {len(current_week)} records")
+        logger.debug("Current week: %s records", len(current_week))
 
         # Create historical dataset
         ref_week = week - 1 if week > 1 else 20
@@ -288,20 +280,21 @@ class NFLDataManager:
                 | ((df["season"] == season) & (df["week"] < week))
             ].copy()
 
-        print(f"[Processing] Historical before filtering: {len(historical)} records")
+        logger.debug("Historical before filtering: %s records", len(historical))
 
         # Filter to only games that were played
         historical = historical[historical["played"] == 1].copy()
-        print(
-            f"[Processing] Historical after 'played' filter: {len(historical)} records"
-        )
+        logger.debug("Historical after 'played' filter: %s records", len(historical))
 
         # Keep only last 2 seasons (season - 2) plus completed weeks of current season
         # For 2025: use 2023, 2024, and weeks in 2025 that have already happened
         min_season = season - HISTORICAL_SEASONS  # season - 2
         historical = historical[historical["season"] >= min_season].copy()
-        print(
-            f"[Processing] Historical after season filter (>={min_season}, last {HISTORICAL_SEASONS} seasons): {len(historical)} records"
+        logger.debug(
+            "Historical after season filter (>= %s, last %s seasons): %s records",
+            min_season,
+            HISTORICAL_SEASONS,
+            len(historical),
         )
 
         # Save the full processed data for future use
@@ -331,12 +324,13 @@ class NFLDataManager:
         )
         from .config import POSITIONS
 
-        print("[Processing] Building feature dataframe with new feature blueprint...")
-        print(f"[Debug] Input data sizes:")
-        print(f"  - player_stats: {len(player_stats)}")
-        print(f"  - pbp: {len(pbp)}")
-        print(f"  - roster: {len(roster)}")
-        print(f"  - schedules: {len(schedules)}")
+        logger.debug(
+            "Building feature dataframe. Input sizes - player_stats: %s, pbp: %s, roster: %s, schedules: %s",
+            len(player_stats),
+            len(pbp),
+            len(roster),
+            len(schedules),
+        )
 
         # Build weekly stats from player_stats (base stats for feature engineering)
         weekly_stats_cols = [
@@ -359,7 +353,7 @@ class NFLDataManager:
             weekly_stats_cols.append("carries")
             
         weekly_stats = player_stats[weekly_stats_cols].copy()
-        print(f"[Debug] weekly_stats from player_stats: {len(weekly_stats)} records")
+        logger.debug("Weekly stats rows: %s", len(weekly_stats))
         
         # For future weeks, create placeholder rows so EWMA features can be calculated
         # Get all players from schedule (for current week) and roster
@@ -405,18 +399,19 @@ class NFLDataManager:
                     missing_players = current_week_df[
                         ~current_week_df["player_id"].isin(existing_stats["player_id"])
                     ]
-                    
+
                     if len(missing_players) > 0:
-                        # Create placeholder rows with NaN/0 for all stat columns
                         placeholder_stats = missing_players.copy()
                         stat_cols = [col for col in weekly_stats_cols if col not in ["player_id", "season", "week"]]
                         for col in stat_cols:
-                            placeholder_stats[col] = 0  # Use 0 for counts, will be handled properly in EWMA
-                        
-                        # Concatenate with existing weekly_stats
+                            placeholder_stats[col] = 0
+
                         weekly_stats = pd.concat([weekly_stats, placeholder_stats], ignore_index=True)
-                        print(f"[Debug] Added {len(missing_players)} placeholder rows for current week players without stats")
-                        print(f"[Debug] weekly_stats after adding placeholders: {len(weekly_stats)} records")
+                        logger.debug(
+                            "Added %s placeholder rows for current week players; weekly_stats now %s rows",
+                            len(missing_players),
+                            len(weekly_stats),
+                        )
         
         # Ensure pbp has game_id, season, week for merging
         if "game_id" not in pbp.columns and "gameId" in pbp.columns:
@@ -446,15 +441,17 @@ class NFLDataManager:
             .drop_duplicates()
             .reset_index(drop=True)
         )
-        print(
-            f"[Debug] roster_summary after position filter: {len(roster_summary)} records"
+        logger.debug(
+            "Roster summary after position filter: %s records", len(roster_summary)
         )
 
         roster_summary["rookie"] = np.where(
             roster_summary.rookie_year == roster_summary.season, 1, 0
         )
         roster_summary = roster_summary[roster_summary.status == "ACT"]
-        print(f"[Debug] roster_summary after ACT filter: {len(roster_summary)} records")
+        logger.debug(
+            "Roster summary after active filter: %s records", len(roster_summary)
+        )
 
         # Build games
         games = schedules[
@@ -469,16 +466,13 @@ class NFLDataManager:
                 "away_qb_id",
             ]
         ].copy()
-        print(f"[Debug] games: {len(games)} records")
+        logger.debug("Games: %s records", len(games))
 
         games["home_wp"] = games["home_moneyline"].apply(
             lambda x: american_odds_to_probability(x) if pd.notnull(x) else 0.5
         )
 
-        print(games)
-
         # Merge home and away games
-        print(f"[Debug] Merging home games...")
         home_games = pd.merge(
             roster_summary,
             games,
@@ -487,12 +481,10 @@ class NFLDataManager:
             right_on=["season", "home_team"],
         ).dropna()
 
-        print(home_games)
         home_games["home"] = 1
         home_games["qb_id"] = home_games["home_qb_id"]
-        print(f"[Debug] home_games: {len(home_games)} records")
+        logger.debug("Home games: %s records", len(home_games))
 
-        print(f"[Debug] Merging away games...")
         away_games = pd.merge(
             roster_summary,
             games,
@@ -502,16 +494,16 @@ class NFLDataManager:
         ).dropna()
         away_games["home"] = 0
         away_games["qb_id"] = away_games["away_qb_id"]
-        print(f"[Debug] away_games: {len(away_games)} records")
+        logger.debug("Away games: %s records", len(away_games))
 
         games_merged = pd.concat([away_games, home_games])
-        print(f"[Debug] games_merged: {len(games_merged)} records")
+        logger.debug("Games merged: %s records", len(games_merged))
 
         if len(games_merged) == 0:
-            print("[ERROR] No games after merging roster with schedule!")
-            print(f"[Debug] Roster teams: {roster_summary['team'].unique()[:20]}")
-            print(f"[Debug] Schedule home teams: {games['home_team'].unique()[:20]}")
-            print(f"[Debug] Schedule away teams: {games['away_team'].unique()[:20]}")
+            logger.error("No games after merging roster with schedule!")
+            logger.debug("Roster teams: %s", roster_summary['team'].unique()[:20])
+            logger.debug("Schedule home teams: %s", games['home_team'].unique()[:20])
+            logger.debug("Schedule away teams: %s", games['away_team'].unique()[:20])
             raise ValueError(
                 "No games found after merging roster with schedule. Team name mismatch?"
             )
@@ -535,7 +527,7 @@ class NFLDataManager:
             ]
         ]
         df = df.rename(columns={"gsis_id": "player_id", "full_name": "player_name"})
-        print(f"[Debug] df after initial build: {len(df)} records")
+        logger.debug("Dataframe after initial build: %s records", len(df))
 
         # Merge touchdowns
         # Target variable: Binary (1 if player scored ANY touchdown, 0 otherwise)
@@ -545,7 +537,7 @@ class NFLDataManager:
         touchdowns = pbp[pbp["touchdown"] == 1][
             ["td_player_id", "game_id"]
         ].drop_duplicates()
-        print(f"[Debug] touchdowns: {len(touchdowns)} records")
+        logger.debug("Touchdown plays: %s records", len(touchdowns))
 
         mdf = pd.merge(
             df,
@@ -558,10 +550,10 @@ class NFLDataManager:
         # Binary target: 1 = scored any TD (rushing or receiving), 0 = no TD
         mdf["touchdown"] = mdf["_merge"].apply(lambda x: 1 if x == "both" else 0)
         df = mdf.drop(["_merge", "td_player_id"], axis=1)
-        print(f"[Debug] df after touchdown merge: {len(df)} records")
+        logger.debug("Dataframe after touchdown merge: %s records", len(df))
         
         # Calculate touchdown attempts and red zone completion % (red zone targets + red zone carries combined)
-        print(f"[Debug] Calculating touchdown attempts and red zone stats from red zone plays...")
+        logger.debug("Calculating touchdown attempts and red zone statistics")
         
         # Red zone attempts (within 20 yards of end zone)
         if "yardline_100" in pbp.columns:
@@ -671,7 +663,9 @@ class NFLDataManager:
             df["touchdown_attempts"] = np.nan
             df["red_zone_completion_pct"] = np.nan
         
-        print(f"[Debug] df after touchdown attempts and red zone stats merge: {len(df)} records")
+        logger.debug(
+            "Dataframe after red zone stat merge: %s records", len(df)
+        )
 
         # Set matchup and home/away
         df["against"] = np.where(
@@ -684,10 +678,10 @@ class NFLDataManager:
         
         # Merge weekly stats for feature engineering
         df = pd.merge(df, weekly_stats, on=["player_id", "season", "week"], how="left")
-        print(f"[Debug] df after weekly_stats merge: {len(df)} records")
+        logger.debug("Dataframe after weekly stats merge: %s records", len(df))
         
         # Use new feature engineering to calculate all player features
-        print(f"[Debug] Calculating player features with new feature engineering...")
+        logger.debug("Calculating player features with new feature engineering")
         # Add game_id to weekly_stats for feature engineering
         weekly_stats_with_game = pd.merge(
             weekly_stats,
@@ -709,7 +703,7 @@ class NFLDataManager:
             on=merge_cols,
             how="left"
         )
-        print(f"[Debug] Added team and position columns to player_features_df")
+        logger.debug("Added team and position columns to player_features_df")
 
         # Red zone touches covers both targets and carries for all positions
         
@@ -726,7 +720,7 @@ class NFLDataManager:
             for feature in qb_receiving_features:
                 if feature in player_features_df.columns:
                     player_features_df.loc[qb_mask, feature] = np.nan
-            print(f"[Debug] Set receiving stats to NaN for {qb_mask.sum()} QB players")
+            logger.debug("Set receiving stats to NaN for %s QB players", int(qb_mask.sum()))
             
             # WR/TE rushing stats (rushing is less significant for WR/TE)
             wr_te_mask = player_features_df["position"].isin(["WR", "TE"])
@@ -734,7 +728,7 @@ class NFLDataManager:
             for feature in wr_te_rushing_features:
                 if feature in player_features_df.columns:
                     player_features_df.loc[wr_te_mask, feature] = np.nan
-            print(f"[Debug] Set rushing stats to NaN for {wr_te_mask.sum()} WR/TE players")
+            logger.debug("Set rushing stats to NaN for %s WR/TE players", int(wr_te_mask.sum()))
             
             # RB receiving stats (receiving is less significant for RB)
             rb_mask = player_features_df["position"] == "RB"
@@ -742,11 +736,11 @@ class NFLDataManager:
             for feature in rb_receiving_features:
                 if feature in player_features_df.columns:
                     player_features_df.loc[rb_mask, feature] = np.nan
-            print(f"[Debug] Set receiving stats to NaN for {rb_mask.sum()} RB players")
+            logger.debug("Set receiving stats to NaN for %s RB players", int(rb_mask.sum()))
         
         # Calculate QB stats separately (only for QBs, then will merge onto all players)
         from .feature_engineering import calculate_qb_stats
-        print(f"[Debug] Calculating QB stats for merging onto all players...")
+        logger.debug("Calculating QB stats for merging onto all players")
         qb_stats_df = calculate_qb_stats(player_features_df, position_col=player_features_df.get("position"))
         
         # Merge QB stats onto all players by qb_id, season, week
@@ -788,14 +782,16 @@ class NFLDataManager:
                 for col in qb_stat_cols:
                     if col in player_features_df.columns:
                         player_features_df.loc[qb_mask, col] = np.nan
-                print(f"[Debug] Set QB stats to NaN for {qb_mask.sum()} QB players (they use personal stats)")
+                logger.debug(
+                    "Set merged QB stats to NaN for %s QB players", int(qb_mask.sum())
+                )
             
             # Note: QB TD stats removed to avoid spurious correlations
             # Only QB yardage stats are kept (qb_passing_yards_ewma, qb_rushing_yards_ewma)
             
-            print(f"[Debug] Merged QB stats onto all players by qb_id, season, week")
+            logger.debug("Merged QB stats onto all players by qb_id, season, week")
         else:
-            print(f"[Warning] Could not merge QB stats - qb_stats_df is empty or qb_id column missing from df")
+            logger.warning("Could not merge QB stats - missing qb_id or stats data")
         
         # Merge player features back (exclude base columns that are already in df)
         # Drop base stat columns that exist in both df and player_features_df to avoid _feat suffixes
@@ -823,13 +819,13 @@ class NFLDataManager:
         # Drop the _feat versions since we want to keep the original columns from df
         feat_cols = [col for col in df.columns if col.endswith('_feat')]
         if feat_cols:
-            print(f"[Debug] Dropping {len(feat_cols)} duplicate _feat columns: {feat_cols[:5]}...")
+            logger.debug("Dropping %s duplicate _feat columns", len(feat_cols))
             df = df.drop(columns=feat_cols)
-        
-        print(f"[Debug] df after player features merge: {len(df)} records")
+
+        logger.debug("Dataframe after player features merge: %s records", len(df))
 
         # Calculate team context features
-        print(f"[Debug] Calculating team context features...")
+        logger.debug("Calculating team context features")
         team_context = calculate_team_context_features(player_features_df, pbp, schedules)
         
         # Drop any existing team context columns from df to avoid merge conflicts
@@ -847,26 +843,24 @@ class NFLDataManager:
         )
         
         # Clean up any duplicate columns with suffixes from merge
-        for col in df.columns:
+        for col in list(df.columns):
             if col.endswith('_x') or col.endswith('_y'):
-                base_col = col[:-2]  # Remove _x or _y suffix
+                base_col = col[:-2]
                 if base_col in team_context.columns:
-                    # Keep the merged value (usually _x), drop the other
                     if col.endswith('_y'):
                         df = df.drop(columns=[col])
                     else:
-                        # Rename _x back to original name
                         df = df.rename(columns={col: base_col})
-        
-        print(f"[Debug] df after team context merge: {len(df)} records")
+
+        logger.debug("Dataframe after team context merge: %s records", len(df))
 
         # Calculate team shares
-        print(f"[Debug] Calculating team shares...")
+        logger.debug("Calculating team shares")
         df = calculate_team_shares(df, team_context)
-        print(f"[Debug] df after team shares: {len(df)} records")
+        logger.debug("Dataframe after team shares: %s records", len(df))
         
         # Calculate defensive features
-        print(f"[Debug] Calculating defensive features...")
+        logger.debug("Calculating defensive features")
         defensive_features = calculate_defensive_features(pbp, schedules)
         df = pd.merge(
             df,
@@ -877,12 +871,12 @@ class NFLDataManager:
             suffixes=("", "_def")
         )
         df = df.drop(["team_def"], axis=1, errors="ignore")
-        print(f"[Debug] df after defensive features merge: {len(df)} records")
+        logger.debug("Dataframe after defensive features merge: %s records", len(df))
         
         # Calculate position-normalized touches_ewma to remove RB/QB bias
         # Normalize touches_ewma by position average (WRs/TEs naturally have lower touches than RBs)
         if "touches_ewma" in df.columns and "position" in df.columns:
-            print(f"[Debug] Calculating position-normalized touches_ewma...")
+            logger.debug("Normalizing touches_ewma by position")
             # Calculate position average touches_ewma (grouped by position, season, week)
             # This gives us the average touches for each position in each week
             position_avg_touches = df.groupby(["position", "season", "week"])["touches_ewma"].mean().reset_index()
@@ -908,16 +902,11 @@ class NFLDataManager:
             # Drop the intermediate position_avg_touches_ewma column
             df = df.drop(columns=["position_avg_touches_ewma"])
             
-            # Debug: Show sample of normalized values
-            if len(df) > 0:
-                sample_normalized = df[df["touches_ewma_position_normalized"].notna()].groupby("position")["touches_ewma_position_normalized"].describe()
-                print(f"[Debug] Position-normalized touches_ewma stats by position:")
-                print(sample_normalized)
 
         # Calculate position-normalized red_zone_touches_ewma to remove RB/QB bias
         # Normalize red_zone_touches_ewma by position average (WRs/TEs naturally have fewer red zone touches than RBs)
         if "red_zone_touches_ewma" in df.columns and "position" in df.columns:
-            print(f"[Debug] Calculating position-normalized red_zone_touches_ewma...")
+            logger.debug("Normalizing red_zone_touches_ewma by position")
             # Calculate position average red_zone_touches_ewma (grouped by position, season, week)
             position_avg_rz_touches = df.groupby(["position", "season", "week"])["red_zone_touches_ewma"].mean().reset_index()
             position_avg_rz_touches = position_avg_rz_touches.rename(columns={"red_zone_touches_ewma": "position_avg_red_zone_touches_ewma"})
@@ -941,11 +930,6 @@ class NFLDataManager:
             # Drop the intermediate position_avg_red_zone_touches_ewma column
             df = df.drop(columns=["position_avg_red_zone_touches_ewma"])
             
-            # Debug: Show sample of normalized values
-            if len(df) > 0:
-                sample_rz_normalized = df[df["red_zone_touches_ewma_position_normalized"].notna()].groupby("position")["red_zone_touches_ewma_position_normalized"].describe()
-                print(f"[Debug] Position-normalized red_zone_touches_ewma stats by position:")
-                print(sample_rz_normalized)
         
         # Calculate reception_rate_ewma (receptions / targets)
         # This is more meaningful than separate receptions/targets features:
@@ -953,7 +937,7 @@ class NFLDataManager:
         # - Low rate = drops/poor hands (bad for TD scoring)
         # - Works for all positions (WR/TE/RB who catch passes)
         if "receptions_ewma" in df.columns and "targets_ewma" in df.columns:
-            print(f"[Debug] Calculating reception_rate_ewma...")
+            logger.debug("Calculating reception_rate_ewma")
             # Calculate rate: receptions / targets
             # Use small epsilon to avoid division by zero
             df["reception_rate_ewma"] = (
@@ -966,16 +950,11 @@ class NFLDataManager:
             # Cap at 1.0 (can't have more receptions than targets)
             df.loc[df["reception_rate_ewma"] > 1.0, "reception_rate_ewma"] = 1.0
             
-            # Debug: Show sample of reception rates by position
-            if len(df) > 0:
-                sample_reception_rate = df[df["reception_rate_ewma"].notna()].groupby("position")["reception_rate_ewma"].describe()
-                print(f"[Debug] Reception rate (receptions/targets) stats by position:")
-                print(sample_reception_rate)
         
         # Calculate combined total_yards_ewma and total_touchdowns_ewma (position-agnostic)
         # This combines rushing + receiving into unified metrics that work for all positions
         # WRs get most from receiving, RBs from rushing, but both contribute to total production
-        print(f"[Debug] Calculating combined total yards and touchdowns...")
+        logger.debug("Calculating combined total yards and touchdowns")
         
         # Total yards = receiving + rushing (works for all positions)
         if "receiving_yards_ewma" in df.columns and "rushing_yards_ewma" in df.columns:
@@ -1022,20 +1001,7 @@ class NFLDataManager:
             df["total_touchdowns_ewma"] = np.nan
         
         # Debug: Show sample of combined totals by position
-        if len(df) > 0:
-            if "total_yards_ewma" in df.columns:
-                sample_total_yds = df[df["total_yards_ewma"].notna()].groupby("position")["total_yards_ewma"].describe()
-                print(f"[Debug] Total yards (receiving + rushing) stats by position:")
-                print(sample_total_yds)
-            if "total_touchdowns_ewma" in df.columns:
-                sample_total_tds = df[df["total_touchdowns_ewma"].notna()].groupby("position")["total_touchdowns_ewma"].describe()
-                print(f"[Debug] Total touchdowns (receiving + rushing) stats by position:")
-                print(sample_total_tds)
-        
-        # Normalize all player usage and performance features by position to remove position bias
-        # This scales features relative to position average (e.g., high-usage WR comparable to high-usage RB)
-        # Must happen AFTER total_yards_ewma and total_touchdowns_ewma are calculated
-        print(f"[Debug] Normalizing player usage and performance features by position...")
+        logger.debug("Normalizing player usage/performance features by position")
         
         # Features to normalize by position (player usage and performance metrics)
         features_to_normalize = [
@@ -1051,7 +1017,7 @@ class NFLDataManager:
         # Normalize each feature by position average
         for feature in features_to_normalize:
             if feature in df.columns and "position" in df.columns:
-                print(f"[Debug] Normalizing {feature} by position...")
+                logger.debug("Normalizing %s by position", feature)
                 
                 # Calculate position average for this feature (grouped by position, season, week)
                 position_avg = df.groupby(["position", "season", "week"])[feature].mean().reset_index()
@@ -1082,11 +1048,7 @@ class NFLDataManager:
                 # Drop intermediate column
                 df = df.drop(columns=[f"position_avg_{feature}"])
                 
-                # Debug: Show sample of normalized values
-                if len(df) > 0:
-                    sample_normalized = df[df[normalized_feature].notna()].groupby("position")[normalized_feature].describe()
-                    print(f"[Debug] Position-normalized {feature} stats by position:")
-                    print(sample_normalized)
+                # Detailed distribution output removed to keep logs concise
         
         # Rename 'home' to 'is_home' for consistency with feature blueprint
         if "home" in df.columns:
@@ -1101,7 +1063,7 @@ class NFLDataManager:
 
         # Clean data
         df = df.drop_duplicates()
-        print(f"[Debug] df after drop_duplicates: {len(df)} records")
+        logger.debug("Dataframe after drop_duplicates: %s records", len(df))
 
         # Filter out players with fewer than EWMA_WEEKS total records (minimum history requirement)
         # This ensures EWMA features have meaningful values
@@ -1116,31 +1078,35 @@ class NFLDataManager:
             df = df[df["player_id"].isin(players_with_enough_history)].copy()
             after_count = len(df)
             if before_count > after_count:
-                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} total records from training data")
-                print(f"[Filter] Remaining players: {len(players_with_enough_history)} ({after_count} records)")
-                min_season_used = season - HISTORICAL_SEASONS
-                print(f"[Filter] This includes players from seasons {min_season_used}+ (season - {HISTORICAL_SEASONS}) as long as they have >= {EWMA_WEEKS} total games")
+                logger.debug(
+                    "Filtered %s players with fewer than %s games", before_count - after_count, EWMA_WEEKS
+                )
+                logger.debug(
+                    "Players remaining after history filter: %s (records: %s)",
+                    len(players_with_enough_history),
+                    after_count,
+                )
 
         # Filter out players marked as "Out" (if report_status exists)
         if "report_status" in df.columns:
             df.loc[~df["report_status"].isin(REPORT_STATUS_ORDER), "report_status"] = "Minor"
         df = df[~(df.report_status == "Out")]
-        print(f"[Debug] df after removing 'Out' status: {len(df)} records")
+        logger.debug("Dataframe after removing 'Out' status: %s records", len(df))
 
         # Add played indicator (1 if player had stats, 0 otherwise)
-        print(f"[Debug] Adding played indicator...")
+        logger.debug("Adding played indicator")
         played = weekly_stats[["player_id", "season", "week"]].drop_duplicates()
         played["played"] = 1
         df = pd.merge(df, played, how="left", on=["player_id", "season", "week"])
         df["played"] = df["played"].fillna(0).astype(int)
-        print(f"[Debug] df after played merge: {len(df)} records")
-        print(f"[Debug] Played distribution: {df['played'].value_counts().to_dict()}")
+        logger.debug("Dataframe after played merge: %s records", len(df))
+        logger.debug("Played distribution: %s", df['played'].value_counts().to_dict())
 
         # Ensure all required features from config are present (fill missing with NaN, not 0)
         from .config import FEATURES
         for feature in FEATURES:
             if feature not in df.columns:
-                print(f"[Warning] Missing feature '{feature}', adding with NaN (not 0)")
+                logger.warning("Missing feature '%s', adding with NaN", feature)
                 if feature == "position":
                     # Position should already be there, but if not, set to unknown
                     df[feature] = df.get("position", "UNK")
@@ -1149,6 +1115,5 @@ class NFLDataManager:
                 else:
                     df[feature] = np.nan  # Use NaN instead of 0 for missing features
 
-        print(f"[Debug] FINAL df: {len(df)} records, columns: {len(df.columns)}")
-        print(f"[Debug] Sample feature columns: {[col for col in df.columns if col in FEATURES][:10]}")
+        logger.debug("Final dataframe shape: (%s, %s)", len(df), len(df.columns))
         return df

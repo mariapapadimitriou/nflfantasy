@@ -2,6 +2,7 @@
 Model Training and Prediction Module
 """
 
+import logging
 import os
 import numpy as np
 import pandas as pd
@@ -17,7 +18,7 @@ try:
     SHAP_AVAILABLE = True
 except ImportError:
     SHAP_AVAILABLE = False
-    print("[Warning] SHAP not available. Feature explanations will not be generated.")
+    logging.getLogger(__name__).warning("SHAP not available. Feature explanations disabled.")
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OrdinalEncoder, StandardScaler
@@ -33,6 +34,9 @@ from sklearn.linear_model import LogisticRegression
 
 from .config import REPORT_STATUS_ORDER, MODEL_PARAMS, POSITIONS, CATEGORICAL_FEATURES
 from .models import MLModel
+
+
+logger = logging.getLogger(__name__)
 
 
 class NFLTouchdownModel:
@@ -294,8 +298,8 @@ class NFLTouchdownModel:
                 # No categorical features, just use passthrough
                 self.encoder = ColumnTransformer(
                     transformers=[],
-                remainder="passthrough",
-            )
+                    remainder="passthrough",
+                )
 
             X_encoded = self.encoder.fit_transform(X)
 

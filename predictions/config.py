@@ -169,7 +169,7 @@ MODEL_PARAMS = {
 
 # Feature Engineering Configuration
 EWMA_ALPHA = 0.3  # Exponential decay factor (0-1, higher = more weight to recent games)
-EWMA_WEEKS = 5  # Number of previous weeks to consider for EWMA
+EWMA_WEEKS = 4  # Number of previous weeks to consider for EWMA
 
 # Winsorization Configuration (to handle breakout games)
 # Caps extreme values before EWMA calculation to prevent outliers from skewing averages

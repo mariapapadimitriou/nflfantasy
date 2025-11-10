@@ -2,9 +2,13 @@
 Comprehensive Feature Engineering for NFL Touchdown Prediction Model
 Implements all features from the feature blueprint
 """
+import logging
 import pandas as pd
 import numpy as np
 from .config import EWMA_ALPHA, WINSORIZE_ENABLED, WINSORIZE_PERCENTILE
+
+
+logger = logging.getLogger(__name__)
 
 
 def winsorize_values(series, percentile=WINSORIZE_PERCENTILE):
@@ -546,14 +550,13 @@ def calculate_qb_stats(player_features, position_col=None):
         if "position" in player_features.columns:
             position_col = player_features["position"]
         else:
-            # Can't identify QBs, return empty DataFrame
-            print("[Warning] No position column available for QB stats calculation")
+            logger.warning("No position column available for QB stats calculation")
             return pd.DataFrame()
     
     # Filter to QBs only
     qb_mask = position_col == "QB"
     if not qb_mask.any():
-        print("[Warning] No QBs found in player_features")
+        logger.warning("No QBs found in player_features")
         return pd.DataFrame()
     
     qb_features = player_features[qb_mask].copy()
