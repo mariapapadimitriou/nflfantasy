@@ -269,23 +269,33 @@ def predict_week_view(request):
         print(f"[Debug] Initial current_week size: {len(current_week)} players")
         
         # Filter players with fewer than EWMA_WEEKS records (minimum history requirement)
-        # NOTE: This counts total records across ALL historical seasons (including 2022) + current week
-        # So a player with 5 games in 2022 and nothing else will be included if current week makes >= 4 total
-        # This ensures consistent filtering between training and predictions
+        # NOTE: For weeks 1-3, count all games (historical + current season) since not enough current season games exist
+        #       For weeks 4+, count only current season games to ensure players have recent activity
         from .config import EWMA_WEEKS
         if 'training_data' in request.session:
             training_data = pd.read_json(request.session['training_data'], orient='split')
-            # Count total records per player (historical + current week)
-            # Historical includes all seasons from min_season (e.g., 2022 if season=2025, HISTORICAL_SEASONS=3)
-            all_data = pd.concat([training_data[["player_id"]], current_week[["player_id"]]], ignore_index=True)
-            player_record_counts = all_data.groupby("player_id").size()
+            if week <= 3:
+                # Early weeks (1-3): Count all games across all seasons (historical + current)
+                all_data = pd.concat([training_data[["player_id"]], current_week[["player_id"]]], ignore_index=True)
+                player_record_counts = all_data.groupby("player_id").size()
+                filter_description = f"total games (all seasons)"
+            else:
+                # Weeks 4+: Count only current season games
+                if 'season' in training_data.columns:
+                    current_season_data = training_data[training_data["season"] == season][["player_id"]].copy()
+                else:
+                    # If season column doesn't exist, assume all training_data is from current season
+                    current_season_data = training_data[["player_id"]].copy()
+                all_current_season_data = pd.concat([current_season_data, current_week[["player_id"]]], ignore_index=True)
+                player_record_counts = all_current_season_data.groupby("player_id").size()
+                filter_description = f"games in current season ({season})"
+            
             players_with_enough_history = player_record_counts[player_record_counts >= EWMA_WEEKS].index
             before_count = len(current_week)
             current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
             after_count = len(current_week)
             if before_count > after_count:
-                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} total records from predictions")
-                print(f"[Filter] Count includes all historical seasons (2022+) + current week")
+                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} {filter_description}")
         else:
             # If no training data, count only current week records (should be 0, but handle edge case)
             player_record_counts = current_week.groupby("player_id").size()
@@ -294,9 +304,10 @@ def predict_week_view(request):
             current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
             after_count = len(current_week)
             if before_count > after_count:
-                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} records from predictions")
+                filter_desc = f"games in current season ({season})" if week > 3 else "total games (all seasons)"
+                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} {filter_desc}")
             if len(current_week) == 0:
-                print(f"[Warning] No players have >= {EWMA_WEEKS} records. This is expected for early weeks.")
+                print(f"[Warning] No players have >= {EWMA_WEEKS} games. This is expected for early weeks.")
         
         # Filter out players who haven't played (no stats) - they shouldn't be predicted
         # NOTE: For future weeks (games haven't happened yet), skip this filter since played=0 for everyone
@@ -570,11 +581,22 @@ def get_feature_data(request):
         from .config import EWMA_WEEKS, FEATURES
         
         # Filter players with fewer than EWMA_WEEKS records
-        # NOTE: Same logic as predict_week_view - counts total records across ALL historical seasons (including 2022) + current week
+        # NOTE: Same logic as predict_week_view - for weeks 1-3, count all games; for weeks 4+, count only current season
         if 'training_data' in request.session:
             training_data = pd.read_json(request.session['training_data'], orient='split')
-            all_data = pd.concat([training_data[["player_id"]], current_week[["player_id"]]], ignore_index=True)
-            player_record_counts = all_data.groupby("player_id").size()
+            if week <= 3:
+                # Early weeks (1-3): Count all games across all seasons (historical + current)
+                all_data = pd.concat([training_data[["player_id"]], current_week[["player_id"]]], ignore_index=True)
+                player_record_counts = all_data.groupby("player_id").size()
+            else:
+                # Weeks 4+: Count only current season games
+                if 'season' in training_data.columns:
+                    current_season_data = training_data[training_data["season"] == season][["player_id"]].copy()
+                else:
+                    # If season column doesn't exist, assume all training_data is from current season
+                    current_season_data = training_data[["player_id"]].copy()
+                all_current_season_data = pd.concat([current_season_data, current_week[["player_id"]]], ignore_index=True)
+                player_record_counts = all_current_season_data.groupby("player_id").size()
             players_with_enough_history = player_record_counts[player_record_counts >= EWMA_WEEKS].index
             current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
         
