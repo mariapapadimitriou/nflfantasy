@@ -50,7 +50,6 @@ def get_sleeper_injury_status_map(force_refresh: bool = False) -> Dict[str, str]
         response.raise_for_status()
         payload = response.json()
     except Exception as exc:
-        logger.warning("Unable to fetch Sleeper injury data: %s", exc)
         return _sleeper_injury_cache.get("data", {})
 
     injury_map: Dict[str, str] = {}

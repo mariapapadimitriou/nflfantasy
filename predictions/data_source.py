@@ -56,27 +56,21 @@ class NFLReadPyDataSource(NFLDataSource):
             )
 
     def load_player_stats(self, seasons: List[int]) -> pd.DataFrame:
-        print(f"[NFLReadPy] Loading player stats for seasons: {seasons}")
         return self.nfl.load_player_stats(seasons=seasons).to_pandas()
 
     def load_pbp(self, seasons: List[int]) -> pd.DataFrame:
-        print(f"[NFLReadPy] Loading play-by-play for seasons: {seasons}")
         return self.nfl.load_pbp(seasons=seasons).to_pandas()
 
     def load_rosters(self, seasons: List[int]) -> pd.DataFrame:
-        print(f"[NFLReadPy] Loading rosters for seasons: {seasons}")
         return self.nfl.load_rosters(seasons=seasons).to_pandas()
 
     def load_schedules(self, seasons: List[int]) -> pd.DataFrame:
-        print(f"[NFLReadPy] Loading schedules for seasons: {seasons}")
         return self.nfl.load_schedules(seasons=seasons).to_pandas()
 
     def load_teams(self) -> pd.DataFrame:
-        print(f"[NFLReadPy] Loading teams master list")
         return self.nfl.load_teams().to_pandas()
 
     def load_injuries(self) -> pd.DataFrame:
-        print(f"[NFLReadPy] Loading teams master list")
         return self.nfl.load_injuries().to_pandas()
 
 

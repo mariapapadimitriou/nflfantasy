@@ -266,7 +266,6 @@ def predict_week_view(request):
         
         # Get current week data from session (NaN values will be preserved)
         current_week = pd.read_json(request.session['current_week_data'], orient='split')
-        print(f"[Debug] Initial current_week size: {len(current_week)} players")
         
         # Filter players with fewer than EWMA_WEEKS records (minimum history requirement)
         # NOTE: For weeks 1-3, count all games (historical + current season) since not enough current season games exist
@@ -294,8 +293,6 @@ def predict_week_view(request):
             before_count = len(current_week)
             current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
             after_count = len(current_week)
-            if before_count > after_count:
-                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} {filter_description}")
         else:
             # If no training data, count only current week records (should be 0, but handle edge case)
             player_record_counts = current_week.groupby("player_id").size()
@@ -303,11 +300,6 @@ def predict_week_view(request):
             before_count = len(current_week)
             current_week = current_week[current_week["player_id"].isin(players_with_enough_history)].copy()
             after_count = len(current_week)
-            if before_count > after_count:
-                filter_desc = f"games in current season ({season})" if week > 3 else "total games (all seasons)"
-                print(f"[Filter] Removed {before_count - after_count} players with < {EWMA_WEEKS} {filter_desc}")
-            if len(current_week) == 0:
-                print(f"[Warning] No players have >= {EWMA_WEEKS} games. This is expected for early weeks.")
         
         # Filter out players who haven't played (no stats) - they shouldn't be predicted
         # NOTE: For future weeks (games haven't happened yet), skip this filter since played=0 for everyone
@@ -320,11 +312,6 @@ def predict_week_view(request):
                 before_count = len(current_week)
                 current_week = current_week[current_week['played'] == 1].copy()
                 after_count = len(current_week)
-                if before_count > after_count:
-                    print(f"[Filter] Removed {before_count - after_count} players with no stats (played=0) from predictions")
-            else:
-                # This is a future week - skip played filter, rely on EWMA features instead
-                print(f"[Filter] Future week detected (all players have played=0). Skipping played filter, using EWMA features instead.")
         
         # Apply minimum usage filter to improve precision (filter out inactive players)
         # Position-aware: QBs use different criteria than skill position players
@@ -362,25 +349,8 @@ def predict_week_view(request):
                 qb_mask = is_qb & (qb_has_rushing | qb_has_red_zone)
                 keep_mask = skill_position_mask | qb_mask
                 
-                # Debug: Show how many players pass each condition
-                if before_count > 0:
-                    print(f"[Debug] Position-aware filter:")
-                    print(f"  - Skill positions: {has_min_touches.sum()} have touches_ewma >= {min_touches}, {has_red_zone.sum() if has_red_zone is not False else 0} have red_zone_touches")
-                    if "carries_ewma" in current_week.columns:
-                        print(f"  - QBs: {qb_has_rushing.sum() if qb_has_rushing is not False else 0} have carries_ewma >= 2.0, {qb_has_red_zone.sum() if qb_has_red_zone is not False else 0} have red_zone_touches")
-                    print(f"  - Combined: {keep_mask.sum()} players pass (out of {before_count})")
-                
                 current_week = current_week[keep_mask].copy()
                 after_count = len(current_week)
-                if before_count > after_count:
-                    removed_qbs = (is_qb & ~qb_mask).sum() if 'qb_mask' in locals() else 0
-                    removed_skill = (is_skill_position & ~skill_position_mask).sum() if 'skill_position_mask' in locals() else 0
-                    print(f"[Filter] Removed {before_count - after_count} players:")
-                    print(f"  - {removed_qbs} QBs (low carries_ewma or no red zone touches)")
-                    print(f"  - {removed_skill} skill positions (low touches_ewma or no red zone touches)")
-                elif len(current_week) == 0 and before_count > 0:
-                    print(f"[Warning] All {before_count} players filtered out by min_usage_filter!")
-                    print(f"[Warning] Consider adjusting thresholds or disabling min_usage_filter")
         
         # Additional filter: Remove players with no meaningful stats (all key features are NaN or 0)
         # Even if played=1, they might have no actual usage stats
@@ -424,14 +394,7 @@ def predict_week_view(request):
                 current_week = current_week[has_stats].copy()
                 after_count = len(current_week)
                 
-                if before_count > after_count:
-                    print(f"[Filter] Removed {before_count - after_count} players with no meaningful stats (all key features NaN/0) from predictions")
-                    print(f"[Filter] Remaining players: {after_count}")
-            else:
-                # If filter would remove too many players, keep them all but log a warning
-                print(f"[Warning] Filter would leave only {players_with_stats} players (need at least {min_players_needed})")
-                print(f"[Warning] Keeping all {before_count} players (may include players with no stats)")
-                print(f"[Warning] This might indicate early season (EWMA features may be NaN) or data quality issue")
+                pass
         
         # Fetch injury status from Sleeper API and map to current players
         injury_status_map = get_sleeper_injury_status_map()
@@ -456,17 +419,14 @@ def predict_week_view(request):
             training_data = pd.read_json(request.session['training_data'], orient='split')
             # Combine training data (historical) with current week data
             full_df = pd.concat([training_data, current_week], ignore_index=True)
-            print(f"[Export] Combined dataframe: {len(training_data)} historical rows + {len(current_week)} current week rows = {len(full_df)} total rows")
         else:
             # If no training data, just use current week
             full_df = current_week
-            print(f"[Export] No training data found, using only current week: {len(full_df)} rows")
         
         # Export full dataframe (all weeks + current week) before predictions to CSV
         base_dir = settings.BASE_DIR if hasattr(settings, 'BASE_DIR') else os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         csv_path = os.path.join(base_dir, 'df.csv')
         full_df.to_csv(csv_path, index=False)
-        print(f"[Export] Saved full dataframe to {csv_path} with {len(full_df)} rows and {len(full_df.columns)} columns")
         
         # Check if we have any players to predict
         if len(current_week) == 0:
@@ -651,10 +611,6 @@ def get_feature_data(request):
         # Get features that exist in current_week (same as what predict_week does)
         available_features = [f for f in FEATURES if f in current_week.columns]
         missing_features = [f for f in FEATURES if f not in current_week.columns]
-        
-        if missing_features:
-            print(f"[Warning] Missing features in feature data view: {missing_features}")
-            print(f"[Info] Showing {len(available_features)} available features out of {len(FEATURES)} requested")
         
         # Combine display columns and feature columns
         # Order: display_cols first, then features (same order as FEATURES)

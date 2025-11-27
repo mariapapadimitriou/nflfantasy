@@ -80,15 +80,25 @@ class NFLTouchdownModel:
         Returns:
             Tuple of (success, message)
         """
-        print(f"\n{'='*60}")
-        print(f"Training model for Season {self.season}, Week {self.week}")
-        print(f"{'='*60}\n")
-
         self.calibrator_params = None
 
         try:
-            if comparison_label:
-                print(f"[Comparison] Evaluating feature configuration: {comparison_label}")
+            
+            # CRITICAL: Ensure no data leakage - exclude current week from training data
+            # This prevents the model from seeing future data during training
+            if "season" in df.columns and "week" in df.columns:
+                before_count = len(df)
+                # Exclude current week: (season < self.season) OR (season == self.season AND week < self.week)
+                df = df[
+                    (df["season"] < self.season) | 
+                    ((df["season"] == self.season) & (df["week"] < self.week))
+                ].copy()
+                after_count = len(df)
+                if before_count == after_count and before_count > 0:
+                    # Check if any records match current week (shouldn't happen, but verify)
+                    current_week_records = df[(df["season"] == self.season) & (df["week"] == self.week)]
+                    if len(current_week_records) > 0:
+                        return (False, f"Data leakage detected: {len(current_week_records)} records from current week ({self.season}, week {self.week}) found in training data")
             
             # Validate required columns
             if "player_id" not in df.columns:
@@ -96,13 +106,58 @@ class NFLTouchdownModel:
             if "touchdown" not in df.columns:
                 return (False, "Missing required column: touchdown")
             
+            # Filter out players with low individual performance (same filter as prediction)
+            # This ensures the model doesn't learn patterns from players who only have high probabilities
+            # due to team stats rather than individual performance
+            if MODEL_PARAMS.get("require_individual_performance", True):
+                min_perf_threshold = MODEL_PARAMS.get("min_individual_performance_threshold", 0.0)
+                before_count = len(df)
+                
+                # Key individual player performance features (non-normalized raw values)
+                individual_features = [
+                    "touches_ewma",
+                    "total_yards_ewma",
+                    "total_touchdowns_ewma",
+                    "red_zone_touches_ewma",
+                ]
+                
+                # Check which features exist in the dataframe
+                available_individual_features = [f for f in individual_features if f in df.columns]
+                
+                if available_individual_features:
+                    # Check if at least one individual feature is above threshold
+                    has_individual_performance = None
+                    for feature in available_individual_features:
+                        feature_values = df[feature]
+                        # Check if feature is not NaN and >= threshold
+                        feature_mask = feature_values.notna() & (feature_values >= min_perf_threshold)
+                        if has_individual_performance is None:
+                            has_individual_performance = feature_mask
+                        else:
+                            has_individual_performance = has_individual_performance | feature_mask
+                    
+                    # Additional check: Require at least 2 individual features to be above threshold
+                    # This prevents players with only one barely-above-threshold feature from passing
+                    feature_count_above_threshold = pd.Series(0, index=df.index)
+                    for feature in available_individual_features:
+                        feature_values = df[feature]
+                        feature_mask = feature_values.notna() & (feature_values >= min_perf_threshold)
+                        feature_count_above_threshold += feature_mask.astype(int)
+                    
+                    # Require at least 2 features above threshold (or at least 1 if only 1-2 features available)
+                    min_features_required = min(2, len(available_individual_features))
+                    has_multiple_features = feature_count_above_threshold >= min_features_required
+                    has_individual_performance = has_individual_performance & has_multiple_features
+                    
+                    # Filter to keep only players with meaningful individual performance
+                    df = df[has_individual_performance].copy()
+                    
+                    after_count = len(df)
+            
             # Filter features to only those that exist in the dataframe
             available_features = [f for f in features if f in df.columns]
             missing_features = [f for f in features if f not in df.columns]
             
-            if missing_features:
-                print(f"[Warning] Missing features in dataframe: {missing_features}")
-                print(f"[Info] Using {len(available_features)} available features out of {len(features)} requested")
             
             if not available_features:
                 return (
@@ -188,9 +243,7 @@ class NFLTouchdownModel:
             numeric_only_features = [f for f in available_numeric_features if f not in categorical_features_to_encode]
             
             # Validate numeric features exist
-            if not numeric_only_features:
-                print(f"[Warning] No numeric features available after filtering. Available columns: {list(X.columns)}")
-            else:
+            if numeric_only_features:
                 # Create a copy to work with
                 X_imputed = X[numeric_only_features].copy()
                 
@@ -323,12 +376,9 @@ class NFLTouchdownModel:
                 random_state=MODEL_PARAMS["random_state"],
             )
             
-            print(f"[Training] Data split: Train={len(X_train)}, Val={len(X_val)}, Test={len(X_test)}")
-
             # Handle NaN values before SMOTE (SMOTE doesn't accept NaN)
             # XGBoost can handle NaN natively, so we'll temporarily replace NaN with a sentinel value
             # then restore NaN after SMOTE but before XGBoost
-            print("[Training] Handling NaN values for SMOTE compatibility...")
             NAN_SENTINEL = -999999.0  # Large negative value that XGBoost will treat as missing
             
             # Convert to numpy array for easier NaN handling
@@ -339,7 +389,6 @@ class NFLTouchdownModel:
             X_train_np = np.where(np.isnan(X_train_np), NAN_SENTINEL, X_train_np)
 
             # Apply SMOTE
-            print("[Training] Applying SMOTE for class balancing...")
             smote = SMOTE(random_state=MODEL_PARAMS["random_state"])
             X_train_resampled, y_train_resampled = smote.fit_resample(X_train_np, y_train)
             
@@ -364,8 +413,6 @@ class NFLTouchdownModel:
             self.y_val = y_val
 
             # Hyperparameter optimization with Optuna
-            print("[Training] Optimizing hyperparameters with Optuna...")
-            print("[Training] Using validation set for early stopping and overfitting detection")
 
             def objective(trial):
                 param = {
@@ -434,8 +481,6 @@ class NFLTouchdownModel:
             )
 
             # Train final model with best params
-            print(f"[Training] Best parameters: {study.best_trial.params}")
-            print(f"[Training] Best validation score: {study.best_value:.4f}")
             best_params = study.best_trial.params.copy()
             best_params.update(
                 {
@@ -451,7 +496,6 @@ class NFLTouchdownModel:
             best_params["missing"] = np.nan  # Explicitly set missing value handling
             
             # Train final model with early stopping on validation set
-            print("[Training] Training final model with early stopping...")
             evals = [(dtrain, "train"), (dval, "val")]
             self.model = xgb.train(
                 best_params,
@@ -477,7 +521,6 @@ class NFLTouchdownModel:
 
             # Optimize prediction threshold based on calibrated validation probabilities
             if MODEL_PARAMS.get("optimize_threshold", False):
-                print("[Training] Optimizing prediction threshold...")
                 fpr, tpr, thresholds = roc_curve(y_val, y_val_pred_prob)
 
                 # Find threshold that maximizes F1 score
@@ -490,13 +533,11 @@ class NFLTouchdownModel:
                         best_f1 = f1
                         best_threshold = threshold
 
-                print(f"[Training] Optimized threshold: {best_threshold:.4f} (F1: {best_f1:.4f})")
                 self.optimal_threshold = best_threshold
             else:
                 self.optimal_threshold = MODEL_PARAMS["prediction_threshold"]
 
             # Evaluate on test set using calibrated probabilities
-            print("\n[Evaluation] Evaluating model on test set...")
             y_test_pred_binary = (y_test_pred_prob >= self.optimal_threshold).astype(int)
 
             # Also evaluate on validation set for comparison
@@ -521,48 +562,7 @@ class NFLTouchdownModel:
             train_logloss = log_loss(y_train_resampled, train_pred_prob)
             train_accuracy = accuracy_score(y_train_resampled, (train_pred_prob >= self.optimal_threshold).astype(int))
             
-            print("\n" + "="*60)
-            print("MODEL PERFORMANCE SUMMARY")
-            print("="*60)
-            print(f"\nValidation Set (used for early stopping):")
-            print(f"  Accuracy:  {val_accuracy:.4f}")
-            print(f"  Precision: {val_precision:.4f}")
-            print(f"  Recall:    {val_recall:.4f}")
-            print(f"  F1 Score:  {val_f1:.4f}")
-            print(f"  Log Loss:  {val_logloss:.4f}")
-            print(f"  AUC-ROC:   {val_auc:.4f}")
-            
-            print(f"\nTest Set (held-out, final evaluation):")
-            print(f"  Accuracy:  {test_accuracy:.4f}")
-            print(f"  Precision: {test_precision:.4f}")
-            print(f"  Recall:    {test_recall:.4f}")
-            print(f"  F1 Score:  {test_f1:.4f}")
-            print(f"  Log Loss:  {test_logloss:.4f}")
-            print(f"  AUC-ROC:   {test_auc:.4f}")
-            
-            print(f"\nOverfitting Check:")
-            print(f"  Train Log Loss:    {train_logloss:.4f}")
-            print(f"  Validation Log Loss: {val_logloss:.4f}")
-            print(f"  Difference:       {abs(train_logloss - val_logloss):.4f}")
-            print(f"  Train Accuracy:   {train_accuracy:.4f}")
-            print(f"  Validation Accuracy: {val_accuracy:.4f}")
-            print(f"  Difference:       {abs(train_accuracy - val_accuracy):.4f}")
-            
-            if abs(train_logloss - val_logloss) > 0.1:
-                print(f"  ⚠️  WARNING: Large gap between train and validation suggests overfitting!")
-            elif abs(train_logloss - val_logloss) > 0.05:
-                print(f"  ⚠️  CAUTION: Moderate gap - monitor for overfitting")
-            else:
-                print(f"  ✓ Good generalization (small gap)")
-            
-            print(f"\nTest Set Classification Report:")
-            print(classification_report(y_test, y_test_pred_binary))
-            print(f"\nTest Set Confusion Matrix:")
-            print(confusion_matrix(y_test, y_test_pred_binary))
-            print("="*60)
-            
             # Calculate feature importance
-            print("\n[Feature Importance] Calculating feature importance...")
             self._calculate_feature_importance(X_encoded, available_features)
 
             # Save model and preprocessors to database
@@ -615,12 +615,8 @@ class NFLTouchdownModel:
             )
 
             if save_model:
-                print(f"\n[Success] Model saved to database for Season {self.season}, Week {self.week}")
-                
                 # Export feature importance to CSV for analysis
                 self._export_feature_importance()
-            else:
-                print(f"\n[Info] Comparison run '{comparison_label or 'unspecified'}' completed (model not saved)")
             
             return (
                 True,
@@ -629,7 +625,6 @@ class NFLTouchdownModel:
 
         except Exception as e:
             error_msg = f"Error training model: {str(e)}"
-            print(f"\n[Error] {error_msg}")
             return False, error_msg
 
     def load(self) -> bool:
@@ -684,8 +679,6 @@ class NFLTouchdownModel:
             else:
                 self.scaler_stds = {}
 
-            print(f"[Model] Loaded model from database for Season {self.season}, Week {self.week}")
-            
             # Load feature importance if available
             if hasattr(ml_model, 'feature_importance') and ml_model.feature_importance:
                 try:
@@ -704,10 +697,8 @@ class NFLTouchdownModel:
             return True
 
         except MLModel.DoesNotExist:
-            print(f"[Error] Model not found in database for Season {self.season}, Week {self.week}")
             return False
         except Exception as e:
-            print(f"[Error] Failed to load model: {str(e)}")
             return False
     
     def _fit_platt_scaler(self, val_probs: np.ndarray, val_labels: np.ndarray) -> None:
@@ -721,7 +712,6 @@ class NFLTouchdownModel:
         val_labels = np.asarray(val_labels)
 
         if len(np.unique(val_labels)) < 2:
-            print("[Calibration] Skipping Platt scaling (validation set needs both classes)")
             return
 
         try:
@@ -731,9 +721,7 @@ class NFLTouchdownModel:
             coef = float(calibrator.coef_.ravel()[0])
             intercept = float(calibrator.intercept_[0])
             self.calibrator_params = {"coef": coef, "intercept": intercept}
-            print(f"[Calibration] Platt scaling fitted (coef={coef:.4f}, intercept={intercept:.4f})")
         except Exception as exc:
-            print(f"[Calibration] Warning: Failed to fit Platt scaler ({exc}). Using raw probabilities.")
             self.calibrator_params = None
 
     def _apply_platt_scaling(self, probs: np.ndarray) -> np.ndarray:
@@ -779,7 +767,6 @@ class NFLTouchdownModel:
             
             # 2. SHAP values (if available) - more accurate for feature importance
             if SHAP_AVAILABLE:
-                print("[Feature Importance] Calculating SHAP values for feature importance...")
                 try:
                     # Use a sample of data for SHAP (too expensive on full dataset)
                     sample_size = min(1000, len(X_encoded))
@@ -801,17 +788,11 @@ class NFLTouchdownModel:
                             self.feature_importance[feat_name]['shap'] = float(mean_shap[i])
                         else:
                             self.feature_importance[feat_name] = {'shap': float(mean_shap[i])}
-                    
-                    print("[Feature Importance] SHAP values calculated successfully")
                 except Exception as e:
-                    print(f"[Warning] Could not calculate SHAP values: {e}")
-            
-            print(f"[Feature Importance] Calculated importance for {len(self.feature_importance)} features")
+                    pass
             
         except Exception as e:
-            print(f"[Warning] Error calculating feature importance: {e}")
-            import traceback
-            traceback.print_exc()
+            pass
     
     def _export_feature_importance(self):
         """Export feature importance to CSV for analysis"""
@@ -820,7 +801,6 @@ class NFLTouchdownModel:
             from django.conf import settings
             
             if not self.feature_importance:
-                print("[Warning] No feature importance data to export")
                 return
             
             # Prepare data for export
@@ -843,22 +823,8 @@ class NFLTouchdownModel:
             csv_path = os.path.join(base_dir, f'feature_importance_s{self.season}_w{self.week}.csv')
             df_importance.to_csv(csv_path, index=False)
             
-            print(f"[Feature Importance] Exported to {csv_path}")
-            
-            # Print top 20 features
-            print("\n[Feature Importance] Top 20 Most Important Features:")
-            print("=" * 80)
-            top_col = 'shap' if 'shap' in df_importance.columns else 'gain'
-            top_features = df_importance.head(20)
-            for idx, row in top_features.iterrows():
-                feat_name = row['feature']
-                importance_val = row[top_col]
-                print(f"  {feat_name:50s} {importance_val:10.4f}")
-            
         except Exception as e:
-            print(f"[Warning] Error exporting feature importance: {e}")
-            import traceback
-            traceback.print_exc()
+            pass
 
     def predict(
         self, current_week: pd.DataFrame, features: list, numeric_features: list, 
@@ -875,9 +841,6 @@ class NFLTouchdownModel:
         Returns:
             DataFrame with predictions
         """
-        print(f"\n{'='*60}")
-        print(f"Predicting touchdowns for Season {self.season}, Week {self.week}")
-        print(f"{'='*60}\n")
 
         if not self.load():
             raise ValueError(
@@ -925,11 +888,6 @@ class NFLTouchdownModel:
                 if before_count > after_count:
                     removed_qbs = (is_qb & ~qb_mask).sum()
                     removed_skill = (is_skill_position & ~skill_position_mask).sum()
-                    print(f"[Filter] Removed {before_count - after_count} players:")
-                    print(f"  - {removed_qbs} QBs (low carries_ewma or no red zone touches)")
-                    print(f"  - {removed_skill} skill positions (low touches_ewma or no red zone touches)")
-                elif len(current_week) == 0:
-                    print(f"[Warning] All players filtered out by min_usage_filter. Consider adjusting thresholds or disabling filter")
 
         try:
             # Validate required columns
@@ -940,9 +898,6 @@ class NFLTouchdownModel:
             available_features = [f for f in features if f in current_week.columns]
             missing_features = [f for f in features if f not in current_week.columns]
             
-            if missing_features:
-                print(f"[Warning] Missing features in prediction dataframe: {missing_features}")
-                print(f"[Info] Using {len(available_features)} available features out of {len(features)} requested")
             
             if not available_features:
                 raise ValueError(
@@ -1083,7 +1038,6 @@ class NFLTouchdownModel:
             shap_base_value = None
             if include_shap and SHAP_AVAILABLE:
                 try:
-                    print("[SHAP] Calculating feature contributions...")
                     # Create SHAP explainer
                     explainer = shap.TreeExplainer(self.model)
                     shap_values_array = explainer.shap_values(X_encoded)
@@ -1110,9 +1064,8 @@ class NFLTouchdownModel:
                             'contributions': feature_contributions,
                             'base_value': float(shap_base_value)
                         }
-                    print(f"[SHAP] Calculated contributions for {len(shap_values)} players")
+                    pass
                 except Exception as e:
-                    print(f"[Warning] Failed to calculate SHAP values: {str(e)}")
                     shap_values = None
 
             # Create output dataframe
@@ -1152,6 +1105,64 @@ class NFLTouchdownModel:
                 how="left",
                 on="player_id",
             )
+            
+            # Filter out players with high probabilities primarily due to team stats but low individual performance
+            # This ensures players need meaningful individual stats, not just be on a good team
+            if MODEL_PARAMS.get("require_individual_performance", True):
+                min_perf_threshold = MODEL_PARAMS.get("min_individual_performance_threshold", 0.0)
+                before_count = len(output)
+                
+                # Key individual player performance features (non-normalized raw values)
+                # These represent actual player usage and performance, not team context
+                individual_features = [
+                    "touches_ewma",
+                    "total_yards_ewma",
+                    "total_touchdowns_ewma",
+                    "red_zone_touches_ewma",
+                ]
+                
+                # Check which features exist in current_week
+                available_individual_features = [f for f in individual_features if f in current_week.columns]
+                
+                if available_individual_features:
+                    # Merge individual features into output
+                    individual_features_df = current_week[["player_id"] + available_individual_features].copy()
+                    output = pd.merge(output, individual_features_df, on="player_id", how="left")
+                    
+                    # Calculate a composite individual performance score
+                    # Player must have at least one feature above threshold AND
+                    # Average of non-NaN individual features should be meaningful
+                    has_individual_performance = None
+                    for feature in available_individual_features:
+                        feature_values = output[feature]
+                        # Check if feature is not NaN and >= threshold
+                        feature_mask = feature_values.notna() & (feature_values >= min_perf_threshold)
+                        if has_individual_performance is None:
+                            has_individual_performance = feature_mask
+                        else:
+                            has_individual_performance = has_individual_performance | feature_mask
+                    
+                    # Additional check: Require at least 2 individual features to be above threshold
+                    # This prevents players with only one barely-above-threshold feature from passing
+                    # Count how many individual features are above threshold for each player
+                    feature_count_above_threshold = pd.Series(0, index=output.index)
+                    for feature in available_individual_features:
+                        feature_values = output[feature]
+                        feature_mask = feature_values.notna() & (feature_values >= min_perf_threshold)
+                        feature_count_above_threshold += feature_mask.astype(int)
+                    
+                    # Require at least 2 features above threshold (or at least 1 if only 1-2 features available)
+                    min_features_required = min(2, len(available_individual_features))
+                    has_multiple_features = feature_count_above_threshold >= min_features_required
+                    has_individual_performance = has_individual_performance & has_multiple_features
+                    
+                    # Filter to keep only players with meaningful individual performance
+                    output = output[has_individual_performance].copy()
+                    
+                    # Drop the individual feature columns from output (they were just for filtering)
+                    output = output.drop(columns=available_individual_features, errors='ignore')
+                    
+                    after_count = len(output)
 
             # Format output
             output["touchdown"] = np.where(
@@ -1175,17 +1186,12 @@ class NFLTouchdownModel:
                     for prob in filtered_probs
                 ]
 
-                print("\n[Evaluation] Predictions vs Actual:")
-                print(classification_report(filtered_td, y_pred_binary))
-                print("\nConfusion Matrix:")
-                print(confusion_matrix(filtered_td, y_pred_binary))
+                pass
 
-            print(f"\n[Success] Generated predictions for {len(output)} players")
             return output, shap_values
 
         except Exception as e:
             error_msg = f"Error making predictions: {str(e)}"
-            print(f"\n[Error] {error_msg}")
             raise
 
 
@@ -1246,7 +1252,6 @@ def compare_breakout_feature_sets(
 
     missing_split = [feat for feat in required_split_features if feat not in df.columns]
     if missing_split:
-        print(f"[Comparison] Skipping breakout feature comparison. Missing columns: {missing_split}")
         return
 
     combined_feature_list = combined_features
@@ -1272,9 +1277,6 @@ def compare_breakout_feature_sets(
         else:
             split_numeric_features.append(feat)
 
-    print("\n" + "=" * 80)
-    print("BREAKOUT FEATURE COMPARISON")
-    print("=" * 80)
 
     scenarios = [
         ("Combined Breakout Features", combined_feature_list, combined_numeric_list),
@@ -1282,17 +1284,10 @@ def compare_breakout_feature_sets(
     ]
 
     for label, feats, num_feats in scenarios:
-        print("\n" + "-" * 80)
-        print(f"[Comparison] Scenario: {label}")
-        print("-" * 80)
 
         model = NFLTouchdownModel(season, week)
         success, message = model.train(df.copy(), feats, num_feats, save_model=False, comparison_label=label)
         if not success:
-            print(f"[Comparison] {label} failed: {message}")
+            pass
         else:
-            print(f"[Comparison] Completed evaluation for '{label}'. See metrics above.")
-
-    print("\n" + "=" * 80)
-    print("END BREAKOUT FEATURE COMPARISON")
-    print("=" * 80 + "\n")
+            pass

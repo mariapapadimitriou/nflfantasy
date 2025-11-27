@@ -95,17 +95,51 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
     # Initialize red_zone_touches column for EWMA calculations
     player_features["red_zone_touches"] = 0
     
-    # Group by player to calculate EWMA features
+    # Forward-fill targets and receptions to future weeks before calculating EWMA
+    # This ensures future weeks have values for EWMA calculation
+    if "targets" in player_features.columns:
+        player_features = player_features.sort_values(by=["player_id", "season", "week"])
+        player_features["targets"] = player_features.groupby("player_id")["targets"].ffill()
+    if "receptions" in player_features.columns:
+        player_features = player_features.sort_values(by=["player_id", "season", "week"])
+        player_features["receptions"] = player_features.groupby("player_id")["receptions"].ffill()
+    
+    # Ensure carries and targets exist before calculating touches
+    if "carries" not in player_features.columns:
+        player_features["carries"] = 0
+    if "targets" not in player_features.columns:
+        player_features["targets"] = 0
+    
+    # Calculate touches - preserve NaN if either component is NaN
+    player_features["touches"] = (
+        player_features["carries"].fillna(0) + player_features["targets"].fillna(0)
+    )
+    # Replace sum of 0s back to NaN if both were originally NaN
+    player_features["touches"] = player_features["touches"].replace(0, np.nan).where(
+        (player_features["carries"].notna()) | (player_features["targets"].notna()),
+        np.nan
+    )
+    # Ensure touches column exists (set to 0 if somehow missing)
+    if "touches" not in player_features.columns:
+        player_features["touches"] = 0
+    
+    # Group by player to calculate EWMA features (after touches is created)
     player_groups = player_features.groupby("player_id", group_keys=False)
     
     # Basic counts (EWMA)
     if "targets" in player_features.columns:
         player_features["targets_ewma"] = player_groups["targets"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+        # Forward-fill targets_ewma to future weeks (carries last known EWMA forward)
+        player_features = player_features.sort_values(by=["player_id", "season", "week"])
+        player_features["targets_ewma"] = player_features.groupby("player_id")["targets_ewma"].ffill()
     else:
         player_features["targets_ewma"] = 0
     
     if "receptions" in player_features.columns:
         player_features["receptions_ewma"] = player_groups["receptions"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+        # Forward-fill receptions_ewma to future weeks (carries last known EWMA forward)
+        player_features = player_features.sort_values(by=["player_id", "season", "week"])
+        player_features["receptions_ewma"] = player_features.groupby("player_id")["receptions_ewma"].ffill()
     else:
         player_features["receptions_ewma"] = 0
     
@@ -123,28 +157,21 @@ def calculate_player_features(player_stats, pbp, weekly_stats):
                 on=["player_id", "game_id", "season", "week"],
                 how="left"
             )
+            # Recreate player_groups after adding carries
+            player_groups = player_features.groupby("player_id", group_keys=False)
             # Don't fillna - preserve NaN for players without carries
             player_features["carries_ewma"] = player_groups["carries"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
         else:
             player_features["carries_ewma"] = np.nan
     
-    # Touches = carries + targets
-    # Ensure carries exists
-    if "carries" not in player_features.columns:
-        player_features["carries"] = 0
-    if "targets" not in player_features.columns:
-        player_features["targets"] = 0
-    
-    # Calculate touches - preserve NaN if either component is NaN
-    player_features["touches"] = (
-        player_features["carries"].fillna(0) + player_features["targets"].fillna(0)
-    )
-    # Replace sum of 0s back to NaN if both were originally NaN
-    player_features["touches"] = player_features["touches"].replace(0, np.nan).where(
-        (player_features["carries"].notna()) | (player_features["targets"].notna()),
-        np.nan
-    )
-    player_features["touches_ewma"] = player_groups["touches"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+    # Calculate touches_ewma (touches should already exist)
+    if "touches" in player_features.columns:
+        # Recreate player_groups to ensure it has the latest columns
+        player_groups = player_features.groupby("player_id", group_keys=False)
+        player_features["touches_ewma"] = player_groups["touches"].apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
+    else:
+        # Fallback if touches somehow doesn't exist
+        player_features["touches_ewma"] = np.nan
     
     # Red zone touches (from play-by-play)
     if "yardline_100" in pbp.columns:
@@ -312,14 +339,39 @@ def calculate_team_context_features(player_features, pbp, schedules):
         raise ValueError("'team' column is required in player_features for team context calculations")
     
     # Team play volume (total offensive plays)
-    if "play_type" in pbp.columns or "down" in pbp.columns:
+    if "posteam" in pbp.columns:
         team_plays = pbp.groupby(["posteam", "game_id", "season", "week"]).size().reset_index(name="total_plays")
         team_plays = team_plays.rename(columns={"posteam": "team"})
+        logger.warning("Calculated team_play_volume from pbp.posteam: %s records", len(team_plays))
+    elif "play_type" in pbp.columns or "down" in pbp.columns:
+        # Try alternative grouping
+        team_plays = pbp.groupby(["posteam", "game_id", "season", "week"]).size().reset_index(name="total_plays")
+        team_plays = team_plays.rename(columns={"posteam": "team"})
+        logger.warning("Calculated team_play_volume from pbp (alternative): %s records", len(team_plays))
     else:
+        logger.warning("Cannot calculate team_play_volume: missing 'posteam', 'play_type', and 'down' columns in pbp. Available columns: %s", list(pbp.columns)[:20])
         # Fallback: use player touches as proxy
+        # Ensure touches exists - calculate it if needed
         if "touches" not in player_features.columns:
-            player_features["touches"] = 0
-        team_plays = player_features.groupby(["team", "game_id", "season", "week"])["touches"].sum().reset_index(name="total_plays")
+            # Calculate touches from carries and targets if available
+            if "carries" not in player_features.columns:
+                player_features["carries"] = 0
+            if "targets" not in player_features.columns:
+                player_features["targets"] = 0
+            player_features["touches"] = (
+                player_features["carries"].fillna(0) + player_features["targets"].fillna(0)
+            )
+            # If both carries and targets are NaN/0, set touches to 0
+            player_features["touches"] = player_features["touches"].fillna(0)
+        
+        # Ensure touches column exists before grouping
+        if "touches" in player_features.columns:
+            team_plays = player_features.groupby(["team", "game_id", "season", "week"])["touches"].sum().reset_index(name="total_plays")
+            logger.warning("Using player touches as fallback for team_play_volume: %s records", len(team_plays))
+        else:
+            # Last resort: create empty dataframe with required columns
+            logger.warning("Cannot calculate team_play_volume: 'touches' column not available. Creating empty team_plays.")
+            team_plays = pd.DataFrame(columns=["team", "game_id", "season", "week", "total_plays"])
     
     # EWMA of team play volume
     team_plays = team_plays.sort_values(by=["team", "season", "week"])
@@ -327,6 +379,17 @@ def calculate_team_context_features(player_features, pbp, schedules):
         team_plays.groupby("team")["total_plays"]
         .apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     )
+    
+    # Forward-fill team_play_volume_ewma within each team to handle early weeks
+    team_plays = team_plays.sort_values(by=["team", "season", "week"])
+    team_plays["team_play_volume_ewma"] = team_plays.groupby("team")["team_play_volume_ewma"].ffill()
+    # Fill any remaining NaN with league median
+    if team_plays["team_play_volume_ewma"].isna().any():
+        league_median = team_plays["team_play_volume_ewma"].median()
+        if pd.notna(league_median):
+            team_plays["team_play_volume_ewma"] = team_plays["team_play_volume_ewma"].fillna(league_median)
+        else:
+            team_plays["team_play_volume_ewma"] = team_plays["team_play_volume_ewma"].fillna(65.0)  # Average plays per game
     
     # Team total red zone touches
     # Ensure red_zone_touches exists in player_features
@@ -340,6 +403,17 @@ def calculate_team_context_features(player_features, pbp, schedules):
         .apply(calculate_ewma_feature, alpha=EWMA_ALPHA)
     )
     
+    # Forward-fill team_total_red_zone_touches_ewma within each team
+    team_rz_touches = team_rz_touches.sort_values(by=["team", "season", "week"])
+    team_rz_touches["team_total_red_zone_touches_ewma"] = team_rz_touches.groupby("team")["team_total_red_zone_touches_ewma"].ffill()
+    # Fill any remaining NaN with league median
+    if team_rz_touches["team_total_red_zone_touches_ewma"].isna().any():
+        league_median = team_rz_touches["team_total_red_zone_touches_ewma"].median()
+        if pd.notna(league_median):
+            team_rz_touches["team_total_red_zone_touches_ewma"] = team_rz_touches["team_total_red_zone_touches_ewma"].fillna(league_median)
+        else:
+            team_rz_touches["team_total_red_zone_touches_ewma"] = team_rz_touches["team_total_red_zone_touches_ewma"].fillna(0.0)
+    
     # Merge team context
     team_context = pd.merge(
         team_plays[["team", "game_id", "season", "week", "team_play_volume_ewma"]],
@@ -347,6 +421,57 @@ def calculate_team_context_features(player_features, pbp, schedules):
         on=["team", "game_id", "season", "week"],
         how="outer"
     )
+    
+    # Extend team context to future weeks using schedules
+    if len(schedules) > 0 and "game_id" in schedules.columns:
+        # Get all games from schedules (including future weeks)
+        all_games = schedules[["game_id", "season", "week", "home_team", "away_team"]].copy()
+        
+        # Create entries for both home and away teams
+        home_games = all_games[["game_id", "season", "week", "home_team"]].copy()
+        home_games = home_games.rename(columns={"home_team": "team"})
+        
+        away_games = all_games[["game_id", "season", "week", "away_team"]].copy()
+        away_games = away_games.rename(columns={"away_team": "team"})
+        
+        all_team_games = pd.concat([home_games, away_games]).drop_duplicates()
+        
+        # Merge with existing team context
+        all_team_games = pd.merge(
+            all_team_games,
+            team_context[["team", "game_id", "season", "week", "team_play_volume_ewma", "team_total_red_zone_touches_ewma"]],
+            on=["team", "game_id", "season", "week"],
+            how="left"
+        )
+        
+        # Sort by team, season, week for forward-filling
+        all_team_games = all_team_games.sort_values(by=["team", "season", "week"])
+        
+        # Forward-fill team context features to future weeks
+        for col in ["team_play_volume_ewma", "team_total_red_zone_touches_ewma"]:
+            if col in all_team_games.columns:
+                # Forward-fill within each team (carries last known value forward to future weeks)
+                all_team_games[col] = all_team_games.groupby("team")[col].ffill()
+                # For teams with no history, use league median
+                if all_team_games[col].isna().any():
+                    league_median = team_context[col].median() if len(team_context) > 0 else None
+                    if pd.notna(league_median):
+                        all_team_games[col] = all_team_games[col].fillna(league_median)
+                    else:
+                        # Use reasonable defaults
+                        if "play_volume" in col:
+                            all_team_games[col] = all_team_games[col].fillna(65.0)
+                        else:
+                            all_team_games[col] = all_team_games[col].fillna(0.0)
+        
+        # Count how many records we had before extension
+        original_count = len(team_context)
+        
+        team_context = all_team_games[["team", "game_id", "season", "week", "team_play_volume_ewma", "team_total_red_zone_touches_ewma"]].copy()
+        
+        future_count = len(team_context) - original_count
+        logger.warning("Extended team context features to future weeks: %s total records (added %s future games)", 
+                      len(team_context), future_count)
     
     # Add win probability and spread from schedules
     if "home_moneyline" in schedules.columns:
@@ -460,6 +585,13 @@ def calculate_defensive_features(pbp, schedules):
         DataFrame with defensive features per team per game
     """
     # Calculate defensive stats from opponent's perspective
+    if "defteam" not in pbp.columns:
+        # Return empty dataframe with required columns
+        return pd.DataFrame(columns=["team", "game_id", "season", "week", 
+                                     "def_ewma_yards_allowed_per_game", "def_ewma_TDs_allowed_per_game",
+                                     "def_ewma_red_zone_completion_pct_allowed", "def_ewma_interceptions_per_game",
+                                     "opponent_red_zone_def_rank"])
+    
     defensive_stats = pbp.groupby(["defteam", "game_id", "season", "week"]).agg({
         "yards_gained": "sum",
         "touchdown": "sum",
@@ -467,6 +599,7 @@ def calculate_defensive_features(pbp, schedules):
     }).reset_index()
     
     defensive_stats = defensive_stats.rename(columns={"defteam": "team"})
+    logger.warning("Calculated defensive stats: %s records", len(defensive_stats))
     
     # Calculate red zone completion % allowed
     if "yardline_100" in pbp.columns and "complete_pass" in pbp.columns:
@@ -517,12 +650,115 @@ def calculate_defensive_features(pbp, schedules):
     else:
         defensive_stats["def_ewma_interceptions_per_game"] = np.nan
     
+    # Forward-fill defensive EWMA features within each team to handle early weeks
+    # This ensures we have values even for week 1 (uses league average or forward-fills from previous season)
+    defensive_stats = defensive_stats.sort_values(by=["team", "season", "week"])
+    
+    # Forward-fill within each team to propagate values to early weeks
+    for col in ["def_ewma_yards_allowed_per_game", "def_ewma_TDs_allowed_per_game", 
+                "def_ewma_red_zone_completion_pct_allowed", "def_ewma_interceptions_per_game"]:
+        if col in defensive_stats.columns:
+            # Forward-fill within each team (carries last known value forward)
+            defensive_stats[col] = defensive_stats.groupby("team")[col].ffill()
+            # For teams with no history, use league average (median to avoid outliers)
+            if defensive_stats[col].isna().any():
+                league_median = defensive_stats[col].median()
+                if pd.notna(league_median):
+                    defensive_stats[col] = defensive_stats[col].fillna(league_median)
+                else:
+                    # If still NaN, use reasonable defaults
+                    if "yards" in col:
+                        defensive_stats[col] = defensive_stats[col].fillna(350.0)  # Average yards allowed
+                    elif "TDs" in col:
+                        defensive_stats[col] = defensive_stats[col].fillna(2.0)  # Average TDs allowed
+                    elif "interception" in col:
+                        defensive_stats[col] = defensive_stats[col].fillna(1.0)  # Average INTs
+                    else:
+                        defensive_stats[col] = defensive_stats[col].fillna(0.5)  # Default for percentages
+    
     # Opponent red zone defense rank (simplified - rank by rz_completion_pct_allowed EWMA)
     defensive_stats = defensive_stats.sort_values(by=["season", "week", "def_ewma_red_zone_completion_pct_allowed"], ascending=[True, True, False])
     defensive_stats["opponent_red_zone_def_rank"] = (
         defensive_stats.groupby(["season", "week"])["def_ewma_red_zone_completion_pct_allowed"]
         .rank(method="min", ascending=False)
-    ).fillna(32)
+    ).fillna(16)  # Default to middle rank (16 out of 32) instead of worst (32)
+    
+    # Extend defensive features to future weeks using schedules
+    # For games that haven't been played yet, use the team's most recent defensive stats
+    if len(schedules) > 0 and "game_id" in schedules.columns:
+        # Get all games from schedules (including future weeks)
+        all_games = schedules[["game_id", "season", "week", "home_team", "away_team"]].copy()
+        
+        # Create entries for both home and away teams
+        home_games = all_games[["game_id", "season", "week", "home_team"]].copy()
+        home_games = home_games.rename(columns={"home_team": "team"})
+        
+        away_games = all_games[["game_id", "season", "week", "away_team"]].copy()
+        away_games = away_games.rename(columns={"away_team": "team"})
+        
+        all_team_games = pd.concat([home_games, away_games]).drop_duplicates()
+        
+        # Merge with existing defensive stats
+        all_team_games = pd.merge(
+            all_team_games,
+            defensive_stats[["team", "game_id", "season", "week", 
+                             "def_ewma_yards_allowed_per_game", "def_ewma_TDs_allowed_per_game",
+                             "def_ewma_red_zone_completion_pct_allowed", "def_ewma_interceptions_per_game",
+                             "opponent_red_zone_def_rank"]],
+            on=["team", "game_id", "season", "week"],
+            how="left"
+        )
+        
+        # Sort by team, season, week for forward-filling
+        all_team_games = all_team_games.sort_values(by=["team", "season", "week"])
+        
+        # Forward-fill defensive features within each team to future weeks
+        for col in ["def_ewma_yards_allowed_per_game", "def_ewma_TDs_allowed_per_game", 
+                    "def_ewma_red_zone_completion_pct_allowed", "def_ewma_interceptions_per_game"]:
+            if col in all_team_games.columns:
+                # Forward-fill within each team (carries last known value forward to future weeks)
+                all_team_games[col] = all_team_games.groupby("team")[col].ffill()
+                # For teams with no history, use league median
+                if all_team_games[col].isna().any():
+                    league_median = defensive_stats[col].median() if len(defensive_stats) > 0 else None
+                    if pd.notna(league_median):
+                        all_team_games[col] = all_team_games[col].fillna(league_median)
+                    else:
+                        # Use reasonable defaults
+                        if "yards" in col:
+                            all_team_games[col] = all_team_games[col].fillna(350.0)
+                        elif "TDs" in col:
+                            all_team_games[col] = all_team_games[col].fillna(2.0)
+                        elif "interception" in col:
+                            all_team_games[col] = all_team_games[col].fillna(1.0)
+                        else:
+                            all_team_games[col] = all_team_games[col].fillna(0.5)
+        
+        # Recalculate opponent_red_zone_def_rank for all weeks (including future)
+        # For each week, calculate rank based on forward-filled stats
+        all_team_games = all_team_games.sort_values(by=["season", "week", "def_ewma_red_zone_completion_pct_allowed"], ascending=[True, True, False])
+        
+        # For each week, calculate rank
+        for (season, week), group in all_team_games.groupby(["season", "week"]):
+            if group["def_ewma_red_zone_completion_pct_allowed"].notna().any():
+                # Calculate rank for this week based on forward-filled stats
+                group_rank = group["def_ewma_red_zone_completion_pct_allowed"].rank(method="min", ascending=False)
+                all_team_games.loc[group.index, "opponent_red_zone_def_rank"] = group_rank
+            else:
+                # If no data for this week, forward-fill the rank from the most recent week
+                all_team_games.loc[group.index, "opponent_red_zone_def_rank"] = np.nan
+        
+        # Forward-fill opponent_red_zone_def_rank within each team to future weeks
+        all_team_games = all_team_games.sort_values(by=["team", "season", "week"])
+        all_team_games["opponent_red_zone_def_rank"] = all_team_games.groupby("team")["opponent_red_zone_def_rank"].ffill().fillna(16)
+        
+        defensive_stats = all_team_games[["team", "game_id", "season", "week", 
+                                         "def_ewma_yards_allowed_per_game", "def_ewma_TDs_allowed_per_game",
+                                         "def_ewma_red_zone_completion_pct_allowed", "def_ewma_interceptions_per_game",
+                                         "opponent_red_zone_def_rank"]].copy()
+        
+        logger.warning("Extended defensive features to future weeks: %s total records (including %s future games)", 
+                      len(defensive_stats), len(all_team_games) - len(defensive_stats))
     
     return defensive_stats[["team", "game_id", "season", "week", 
                            "def_ewma_yards_allowed_per_game", "def_ewma_TDs_allowed_per_game",
@@ -550,13 +786,11 @@ def calculate_qb_stats(player_features, position_col=None):
         if "position" in player_features.columns:
             position_col = player_features["position"]
         else:
-            logger.warning("No position column available for QB stats calculation")
             return pd.DataFrame()
     
     # Filter to QBs only
     qb_mask = position_col == "QB"
     if not qb_mask.any():
-        logger.warning("No QBs found in player_features")
         return pd.DataFrame()
     
     qb_features = player_features[qb_mask].copy()

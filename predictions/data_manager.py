@@ -53,7 +53,6 @@ class NFLDataManager:
             
             records = list(query.values())
             if records:
-                logger.info("Cache: loading %s historical records from database", len(records))
                 df = pd.DataFrame(records)
                 # Reconstruct features from JSON field
                 if 'features' in df.columns and len(df) > 0:
@@ -67,9 +66,7 @@ class NFLDataManager:
                 self.historical_data = df
                 return df
         except Exception as e:
-            logger.warning("Cache: error loading from database: %s", e)
-        
-        return None
+            return None
 
     def save_historical_data(self, df: pd.DataFrame):
         """Save historical data to database"""
@@ -77,7 +74,6 @@ class NFLDataManager:
             return
         
         try:
-            logger.info("Cache: saving historical data to database")
             
             # Prepare data for bulk insert
             training_records = []
@@ -113,7 +109,6 @@ class NFLDataManager:
                 
                 # Bulk insert
                 TrainingData.objects.bulk_create(training_records, ignore_conflicts=True)
-                logger.info("Cache: saved %s records to database", len(training_records))
             
             self.historical_data = df
         except Exception as e:
@@ -141,7 +136,6 @@ class NFLDataManager:
         Returns:
             Dictionary with 'df' (historical) and 'current_week' dataframes
         """
-        logger.info("Loading data for season %s, week %s", season, week)
 
         # Load historical data from database if available
         if not force_reload:
@@ -156,11 +150,6 @@ class NFLDataManager:
                 if max_cached_season > season or (
                     max_cached_season == season and max_cached_week >= week - 1
                 ):
-                    logger.info(
-                        "Cache hit: using data up to season %s, week %s",
-                        max_cached_season,
-                        max_cached_week,
-                    )
                     # Filter to appropriate cutoff
                     ref_week = week - 1 if week > 1 else 20
                     historical = cached_data[
@@ -179,12 +168,10 @@ class NFLDataManager:
                     }
 
         # Load fresh data
-        logger.info("Loading fresh data from source")
         return self._load_fresh_data(season, week)
 
     def _load_current_week(self, season: int, week: int) -> pd.DataFrame:
         """Load only the current week's data"""
-        logger.info("Loading current week data for season %s, week %s", season, week)
 
         try:
             # Load minimal data for current week
@@ -229,13 +216,11 @@ class NFLDataManager:
             return current_week
 
         except Exception as e:
-            logger.error("Failed to load current week: %s", e)
             raise
 
     def _load_fresh_data(self, season: int, week: int) -> Dict[str, pd.DataFrame]:
         """Load fresh data from source and process"""
         seasons = self.get_seasons_to_load(season, week)
-        logger.info("Loading seasons %s", seasons)
 
         # Load all data
         player_stats = self.data_source.load_player_stats(seasons)
@@ -260,7 +245,6 @@ class NFLDataManager:
         # Process data
         df = self._process_data(player_stats, pbp, roster, schedules, season, week)
 
-        logger.info("Processed data: %s total records", len(df))
 
         # Split into historical and current week
         current_week = df[(df["season"] == season) & (df["week"] == week)].copy()
@@ -347,13 +331,24 @@ class NFLDataManager:
         # Add receptions and targets if they exist
         if "receptions" in player_stats.columns:
             weekly_stats_cols.append("receptions")
+        else:
+            logger.warning("'receptions' column NOT found in player_stats. Available columns: %s", list(player_stats.columns)[:20])
         if "targets" in player_stats.columns:
             weekly_stats_cols.append("targets")
+        else:
+            logger.warning("'targets' column NOT found in player_stats. Available columns: %s", list(player_stats.columns)[:20])
         if "carries" in player_stats.columns:
             weekly_stats_cols.append("carries")
             
         weekly_stats = player_stats[weekly_stats_cols].copy()
-        logger.debug("Weekly stats rows: %s", len(weekly_stats))
+        
+        # Check for null values in key columns
+        if "receptions" in weekly_stats.columns:
+            null_receptions = weekly_stats["receptions"].isna().sum()
+            logger.warning("Receptions: %s null values out of %s total", null_receptions, len(weekly_stats))
+        if "targets" in weekly_stats.columns:
+            null_targets = weekly_stats["targets"].isna().sum()
+            logger.warning("Targets: %s null values out of %s total", null_targets, len(weekly_stats))
         
         # For future weeks, create placeholder rows so EWMA features can be calculated
         # Get all players from schedule (for current week) and roster
@@ -500,7 +495,6 @@ class NFLDataManager:
         logger.debug("Games merged: %s records", len(games_merged))
 
         if len(games_merged) == 0:
-            logger.error("No games after merging roster with schedule!")
             logger.debug("Roster teams: %s", roster_summary['team'].unique()[:20])
             logger.debug("Schedule home teams: %s", games['home_team'].unique()[:20])
             logger.debug("Schedule away teams: %s", games['away_team'].unique()[:20])
@@ -790,8 +784,6 @@ class NFLDataManager:
             # Only QB yardage stats are kept (qb_passing_yards_ewma, qb_rushing_yards_ewma)
             
             logger.debug("Merged QB stats onto all players by qb_id, season, week")
-        else:
-            logger.warning("Could not merge QB stats - missing qb_id or stats data")
         
         # Merge player features back (exclude base columns that are already in df)
         # Drop base stat columns that exist in both df and player_features_df to avoid _feat suffixes
@@ -859,19 +851,92 @@ class NFLDataManager:
         df = calculate_team_shares(df, team_context)
         logger.debug("Dataframe after team shares: %s records", len(df))
         
+        # Debug: Check team context features before defensive features
+        team_context_cols = ["team_play_volume_ewma", "team_total_red_zone_touches_ewma"]
+        for col in team_context_cols:
+            if col in df.columns:
+                non_null = df[col].notna().sum()
+                null_count = df[col].isna().sum()
+                logger.warning(f"Team context {col}: {non_null} non-null, {null_count} null ({non_null/len(df)*100:.1f}% populated)")
+            else:
+                logger.warning(f"Team context column {col} missing from dataframe!")
+        
         # Calculate defensive features
-        logger.debug("Calculating defensive features")
         defensive_features = calculate_defensive_features(pbp, schedules)
+        
+        # Debug: Check defensive features before merge
+        if len(defensive_features) > 0:
+            def_cols = ["def_ewma_TDs_allowed_per_game", "def_ewma_interceptions_per_game", "opponent_red_zone_def_rank"]
+            for col in def_cols:
+                if col in defensive_features.columns:
+                    non_null_count = defensive_features[col].notna().sum()
+                    null_count = defensive_features[col].isna().sum()
+                    if non_null_count > 0:
+                        mean_val = defensive_features[col].mean()
+                        std_val = defensive_features[col].std()
+                        logger.warning(f"Defensive feature {col}: {non_null_count} non-null, {null_count} null, mean={mean_val:.3f}, std={std_val:.3f}")
+                    else:
+                        logger.warning(f"Defensive feature {col}: All values are NaN!")
+        
+        # Check if 'against' column exists and has valid values
+        if "against" in df.columns:
+            against_null_count = df["against"].isna().sum()
+            against_unique = df["against"].nunique()
+            logger.warning(f"Against column: {against_null_count} null values, {against_unique} unique teams")
+        else:
+            logger.warning("'against' column missing - cannot merge defensive features")
+        
+        # Debug: Check merge keys before merge
+        if len(defensive_features) > 0:
+            logger.warning(f"Defensive features merge keys - df['against'] unique: {df['against'].nunique()}, defensive_features['team'] unique: {df['against'].nunique()}")
+            logger.warning(f"Defensive features merge keys - df['game_id'] unique: {df['game_id'].nunique()}, defensive_features['game_id'] unique: {defensive_features['game_id'].nunique()}")
+            # Check for mismatches
+            df_against_teams = set(df['against'].dropna().unique())
+            def_teams = set(defensive_features['team'].dropna().unique())
+            missing_teams = df_against_teams - def_teams
+            if missing_teams:
+                logger.warning(f"Teams in df['against'] but not in defensive_features['team']: {missing_teams}")
+            df_game_ids = set(df['game_id'].dropna().unique())
+            def_game_ids = set(defensive_features['game_id'].dropna().unique())
+            missing_game_ids = df_game_ids - def_game_ids
+            if missing_game_ids:
+                logger.warning(f"Game IDs in df but not in defensive_features: {len(missing_game_ids)} games")
+        
         df = pd.merge(
             df,
             defensive_features,
             left_on=["against", "game_id", "season", "week"],
             right_on=["team", "game_id", "season", "week"],
             how="left",
-            suffixes=("", "_def")
+            suffixes=("", "_def"),
+            indicator=True
         )
-        df = df.drop(["team_def"], axis=1, errors="ignore")
-        logger.debug("Dataframe after defensive features merge: %s records", len(df))
+        
+        # Check merge results
+        merge_stats = df['_merge'].value_counts()
+        logger.warning(f"Defensive features merge results: {merge_stats.to_dict()}")
+        df = df.drop(["_merge", "team_def"], axis=1, errors="ignore")
+        
+        # Debug: Check defensive features after merge
+        def_cols = ["def_ewma_TDs_allowed_per_game", "def_ewma_interceptions_per_game", "opponent_red_zone_def_rank"]
+        for col in def_cols:
+            if col in df.columns:
+                non_null_count = df[col].notna().sum()
+                null_count = df[col].isna().sum()
+                matched_pct = (non_null_count / len(df) * 100) if len(df) > 0 else 0
+                logger.warning(f"After merge - {col}: {non_null_count} non-null ({matched_pct:.1f}%), {null_count} null")
+                if non_null_count > 0:
+                    mean_val = df[col].mean()
+                    std_val = df[col].std()
+                    logger.warning(f"  Mean={mean_val:.3f}, Std={std_val:.3f}")
+                
+                # Check specific cases where merge failed
+                if null_count > 0:
+                    failed_merges = df[df[col].isna()][["player_name", "team", "against", "game_id", "season", "week"]].head(5)
+                    if len(failed_merges) > 0:
+                        logger.warning(f"Sample of failed merges for {col}:")
+                        for idx, row in failed_merges.iterrows():
+                            logger.warning(f"  {row['player_name']} ({row['team']} vs {row['against']}) - game_id: {row['game_id']}, season: {row['season']}, week: {row['week']}")
         
         # Calculate position-normalized touches_ewma to remove RB/QB bias
         # Normalize touches_ewma by position average (WRs/TEs naturally have lower touches than RBs)
@@ -1106,7 +1171,6 @@ class NFLDataManager:
         from .config import FEATURES
         for feature in FEATURES:
             if feature not in df.columns:
-                logger.warning("Missing feature '%s', adding with NaN", feature)
                 if feature == "position":
                     # Position should already be there, but if not, set to unknown
                     df[feature] = df.get("position", "UNK")

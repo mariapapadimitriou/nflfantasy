@@ -165,10 +165,24 @@ MODEL_PARAMS = {
     # Prediction Filtering (to improve precision)
     "min_touches_ewma": 3.0,  # Minimum touches_ewma to make predictions (filters out inactive players)
     "min_usage_filter": True,  # Apply minimum usage filters before prediction
+    
+    # Individual Player Performance Filter (to prevent team stats from dominating)
+    "require_individual_performance": True,  # Require meaningful individual player stats, not just team stats
+    "min_individual_performance_threshold": 0.0,  # Minimum individual performance (raw feature values should be >= this)
+    # At least 2 of these individual features must be above threshold:
+    # - touches_ewma >= threshold
+    # - total_yards_ewma >= threshold  
+    # - total_touchdowns_ewma >= threshold
+    # - red_zone_touches_ewma >= threshold
+    # Note: Threshold values are raw (non-normalized) feature values
+    # For touches_ewma: 0.0 means any touches, higher values (e.g., 3.0) require more usage
+    # For total_yards_ewma: 0.0 means any yards, higher values require more production
+    # For total_touchdowns_ewma: 0.0 means any TDs, higher values require more scoring
+    # For red_zone_touches_ewma: 0.0 means any red zone touches, higher values require more red zone usage
 }
 
 # Feature Engineering Configuration
-EWMA_ALPHA = 0.3  # Exponential decay factor (0-1, higher = more weight to recent games)
+EWMA_ALPHA = 0.5  # Exponential decay factor (0-1, higher = more weight to recent games)
 EWMA_WEEKS = 4  # Number of previous weeks to consider for EWMA
 
 # Winsorization Configuration (to handle breakout games)
