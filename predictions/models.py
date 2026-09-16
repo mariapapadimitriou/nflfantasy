@@ -2,7 +2,6 @@
 Django models for NFL Touchdown Predictions
 """
 from django.db import models
-import json
 
 
 class TrainingData(models.Model):
@@ -47,22 +46,31 @@ class MLModel(models.Model):
     scaler_file = models.BinaryField()
     encoder_file = models.BinaryField()
     
-    # Position-aware imputation/scaling parameters (stored as JSON strings)
-    features_with_missing = models.TextField(null=True, blank=True)  # Features that keep NaN
-    scaler_means = models.TextField(null=True, blank=True)  # Scaling means for each feature
-    scaler_stds = models.TextField(null=True, blank=True)  # Scaling stds for each feature
-    feature_importance = models.TextField(null=True, blank=True)  # Feature importance scores (JSON)
-    
+    # Serialized FeaturePipeline: feature order plus the scaling statistics.
+    # A model cannot be scored without it, since prediction has to reproduce
+    # training's exact column layout and standardization.
+    pipeline_state = models.TextField(null=True, blank=True)
+    calibrator = models.TextField(null=True, blank=True)  # Platt scaling coefficients
+    metrics = models.TextField(null=True, blank=True)  # Full metric set as JSON
+
+    features_with_missing = models.TextField(null=True, blank=True)  # legacy, unused
+    scaler_means = models.TextField(null=True, blank=True)  # mirrored for inspection
+    scaler_stds = models.TextField(null=True, blank=True)  # mirrored for inspection
+    feature_importance = models.TextField(null=True, blank=True)
+
     # Model metadata
     created_at = models.DateTimeField(auto_now_add=True)
     training_records = models.IntegerField(null=True)
-    
-    # Model performance metrics
-    optimal_threshold = models.FloatField(null=True, blank=True)  # Optimized prediction threshold
+
+    # Headline metrics. AUC and precision@k describe ranking quality, which is
+    # what a shortlist is judged on; accuracy is misleading at a ~20% base rate.
+    optimal_threshold = models.FloatField(null=True, blank=True)
     validation_accuracy = models.FloatField(null=True, blank=True)
     validation_f1 = models.FloatField(null=True, blank=True)
+    validation_auc = models.FloatField(null=True, blank=True)
     test_accuracy = models.FloatField(null=True, blank=True)
     test_f1 = models.FloatField(null=True, blank=True)
+    test_auc = models.FloatField(null=True, blank=True)
     
     class Meta:
         db_table = 'ml_models'

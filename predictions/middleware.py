@@ -17,7 +17,7 @@ class JsonCsrfViewMiddleware(CsrfViewMiddleware):
         if request.path.startswith('/api/'):
             try:
                 return super().process_view(request, view_func, view_args, view_kwargs)
-            except Exception as e:
+            except Exception:
                 # Return JSON error instead of HTML
                 return JsonResponse({
                     'success': False,
