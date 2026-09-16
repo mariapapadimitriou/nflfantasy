@@ -23,7 +23,7 @@ from .data_manager import NFLDataManager
 from .data_source import NFLDataSource
 from .feature_engineering import add_position_normalized_features, calculate_ewma_feature
 from .ml_model import NFLTouchdownModel, precision_at_k
-from .preprocessing import FeaturePipeline
+from .preprocessing import FeaturePipeline, PlattCalibrator
 
 TEAMS = ["AAA", "BBB", "CCC", "DDD"]
 POSITION_PLAN = [("QB", 1), ("RB", 2), ("WR", 3), ("TE", 1)]
@@ -265,6 +265,23 @@ class UnitTests(TestCase):
         partial = pipeline.transform(pd.DataFrame({"a": [1.0]}))
         self.assertEqual(partial.shape[1], 2, "missing feature must not shift columns")
         self.assertTrue(np.isnan(partial[0, 1]))
+
+    def test_calibration_matches_the_base_rate(self):
+        """Calibrated probabilities should average out to the observed rate.
+
+        Fitting the calibrator with balanced class weights leaves the output
+        balanced instead, inflating every probability by roughly 2.5x.
+        """
+        rng = np.random.default_rng(0)
+        labels = (rng.random(2000) < 0.19).astype(int)
+        # Scores that separate the classes but sit on a balanced scale, which is
+        # what scale_pos_weight produces.
+        scores = np.clip(0.5 + 0.2 * labels + rng.normal(0, 0.15, 2000), 0, 1)
+
+        calibrator = PlattCalibrator.fit(scores, labels)
+        calibrated = calibrator.apply(scores)
+
+        self.assertAlmostEqual(calibrated.mean(), labels.mean(), delta=0.03)
 
     def test_precision_at_k_ranks_rather_than_thresholds(self):
         y_true = [0, 1, 1, 0, 1]

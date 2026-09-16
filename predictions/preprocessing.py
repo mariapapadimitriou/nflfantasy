@@ -126,7 +126,14 @@ class PlattCalibrator:
             logger.warning("Skipping calibration: validation set has a single class")
             return None
 
-        model = LogisticRegression(solver="lbfgs", class_weight="balanced")
+        # Deliberately unweighted. The point of calibration is to map scores
+        # back onto real-world frequencies, and scale_pos_weight has already
+        # pushed the raw scores towards a balanced distribution. Fitting this
+        # with class_weight="balanced" too leaves the output balanced rather
+        # than calibrated: mean predicted probability lands near 0.47 against a
+        # base rate of 0.19, so a "74%" reads as a coin flip's cousin when the
+        # player's real chance is closer to 40%.
+        model = LogisticRegression(solver="lbfgs")
         model.fit(probs, labels)
         return cls(model.coef_.ravel()[0], model.intercept_[0])
 
