@@ -15,12 +15,21 @@ _sleeper_injury_cache = {
 }
 
 
-def american_odds_to_probability(odds):
-    odds = int(odds)
+def american_odds_to_probability(odds) -> float:
+    """Convert American moneyline odds to an implied win probability.
+
+    Returns an even 0.5 when no line is posted, which is common for games that
+    are still days away. The result carries the bookmaker's margin; since the
+    away side is derived as ``1 - home``, the pair stays internally consistent.
+    """
+    try:
+        odds = int(odds)
+    except (TypeError, ValueError):
+        return 0.5
+
     if odds > 0:
         return 100 / (odds + 100)
-    else:
-        return -odds / (-odds + 100)
+    return -odds / (-odds + 100)
 
 
 def get_sleeper_injury_status_map(force_refresh: bool = False) -> Dict[str, str]:
@@ -49,7 +58,7 @@ def get_sleeper_injury_status_map(force_refresh: bool = False) -> Dict[str, str]
         response = requests.get(SLEEPER_PLAYERS_URL, timeout=10)
         response.raise_for_status()
         payload = response.json()
-    except Exception as exc:
+    except Exception:
         return _sleeper_injury_cache.get("data", {})
 
     injury_map: Dict[str, str] = {}
