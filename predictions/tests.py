@@ -11,7 +11,7 @@ import unittest.mock
 
 import numpy as np
 import pandas as pd
-from django.test import TestCase
+from django.test import TestCase, override_settings
 
 from .config import (
     FEATURES,
@@ -273,8 +273,13 @@ class UnitTests(TestCase):
         self.assertEqual(precision_at_k(y_true, y_prob, 5), 0.6)
 
 
+@override_settings(FEATURE_IMPORTANCE_DIR=None)
 class PipelineTests(TestCase):
-    """Full data build, training and prediction against the fixture."""
+    """Full data build, training and prediction against the fixture.
+
+    The feature-importance export is switched off so a test run does not write
+    CSVs into the repository root.
+    """
 
     @classmethod
     def setUpClass(cls):

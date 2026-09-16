@@ -494,17 +494,27 @@ class NFLTouchdownModel:
         }
 
     def _export_feature_importance(self) -> None:
+        """Write the gain/weight/cover table alongside the project by default.
+
+        The destination is a setting so tests can redirect it; training used to
+        drop a CSV into the repository root on every run, including from the
+        test suite.
+        """
         if not self.feature_importance:
             return
         from django.conf import settings
+
+        directory = getattr(settings, "FEATURE_IMPORTANCE_DIR", None)
+        if directory is None:
+            return
 
         frame = pd.DataFrame(
             [{"feature": name, **values} for name, values in self.feature_importance.items()]
         ).sort_values("gain", ascending=False)
 
+        os.makedirs(directory, exist_ok=True)
         path = os.path.join(
-            str(settings.BASE_DIR),
-            f"feature_importance_s{self.season}_w{self.week}.csv",
+            str(directory), f"feature_importance_s{self.season}_w{self.week}.csv"
         )
         frame.to_csv(path, index=False)
         logger.info("Wrote feature importance to %s", path)

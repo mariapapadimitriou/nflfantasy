@@ -121,6 +121,10 @@ STATICFILES_DIRS = [
     BASE_DIR / "static",
 ]
 
+# Where training writes its feature-importance CSV. Set to None to disable the
+# export; the test suite redirects it so runs do not litter the repository.
+FEATURE_IMPORTANCE_DIR = BASE_DIR
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
 
